@@ -95,7 +95,7 @@ class SecretStore:
 
         Secret.password_clear_sync(self.schema, {}, None)
 
-    def save(self) -> None:
+    def save(self, is_pkce: bool = False) -> None:
         """Save the current session tokens to secure storage.
 
         Stores the session's token_type, access_token, and refresh_token
@@ -111,6 +111,7 @@ class SecretStore:
             "access-token": access_token,
             "refresh-token": refresh_token,
             "expiry-time": str(expiry_time),
+            "is-pkce": is_pkce,
         }
 
         json_data: str = json.dumps(self.token_dictionary)
