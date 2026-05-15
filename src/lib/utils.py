@@ -254,12 +254,12 @@ def get_favourites() -> None:
     user = session.user
 
     try:
-        favourite_artists = user.favorites.artists()
-        favourite_tracks = user.favorites.tracks(
-            order=ItemOrder.Date, 
+        favourite_artists = user.favorites.artists_paginated()
+        favourite_tracks = user.favorites.tracks_paginated(
+            order=ItemOrder.Date,
             order_direction=OrderDirection.Descending
         )
-        favourite_albums = user.favorites.albums()
+        favourite_albums = user.favorites.albums_paginated()
         favourite_playlists = user.favorites.playlists()
         favourite_mixes = user.favorites.mixes()
         user_playlists = user.playlists()
