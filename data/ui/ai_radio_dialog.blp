@@ -15,12 +15,20 @@ template $HTAIRadioDialog: Adw.Dialog {
       ]
     }
 
-    Entry prompt_entry {
-      placeholder-text: _("Describe the music you want…");
+    ListBox {
       margin-start: 12;
       margin-end: 12;
       margin-top: 12;
       margin-bottom: 6;
+      selection-mode: none;
+
+      styles [
+        "boxed-list",
+      ]
+
+      Adw.EntryRow prompt_entry {
+        title: _("Describe the music you want…");
+      }
     }
 
     ListBox {
