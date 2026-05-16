@@ -32,7 +32,7 @@ from .mpris import MPRIS
 from .pages import (HTAIRadioPage, HTAlbumPage, HTArtistPage, HTCollectionPage,
                     HTExplorePage, HTGenericPage, HTMixPage, HTNotLoggedInPage,
                     HTPlaylistPage)
-from .widgets import (HTAIRadioDialog, HTGenericTrackWidget, HTLinkLabelWidget,
+from .widgets import (HTGenericTrackWidget, HTLinkLabelWidget,
                       HTLyricsWidget, HTQueueWidget)
 
 import logging
@@ -44,7 +44,6 @@ GObject.type_register(HTGenericTrackWidget)
 GObject.type_register(HTLinkLabelWidget)
 GObject.type_register(HTQueueWidget)
 GObject.type_register(HTLyricsWidget)
-GObject.type_register(HTAIRadioDialog)
 
 
 @Gtk.Template(resource_path="/io/github/nokse22/high-tide/ui/window.ui")
@@ -205,7 +204,6 @@ class HighTideWindow(Adw.ApplicationWindow):
         self.ai_generation_id: int = 0
         self.ai_cancel_event: threading.Event | None = None
         self.ai_radio_page: HTAIRadioPage | None = None
-        self._ai_dialog: HTAIRadioDialog | None = None
 
         self.videoplayer = Gtk.MediaFile.new()
 
@@ -626,6 +624,8 @@ class HighTideWindow(Adw.ApplicationWindow):
         nav_page.disconnect_all()
         if nav_page is self.ai_radio_page:
             self.ai_radio_page = None
+            if self.ai_cancel_event:
+                self.ai_cancel_event.set()
 
     @Gtk.Template.Callback("on_visible_page_changed")
     def on_visible_page_changed(self, nav_view, *args):
@@ -636,9 +636,9 @@ class HighTideWindow(Adw.ApplicationWindow):
                 self.explore_button.set_active(True)
             case "collection":
                 self.collection_button.set_active(True)
-            case _:
-                if self.navigation_view.get_visible_page() is self.ai_radio_page:
-                    self.ai_radio_button.set_active(True)
+            case "ai_radio":
+                self.ai_radio_button.set_active(True)
+                self._refresh_ai_radio_state()
 
     @Gtk.Template.Callback("on_sidebar_page_changed")
     def on_sidebar_page_changed(self, *args):
@@ -812,25 +812,37 @@ class HighTideWindow(Adw.ApplicationWindow):
 
     @Gtk.Template.Callback("on_ai_radio_button_clicked")
     def on_ai_radio_button_clicked(self, widget):
+        if self.navigation_view.find_page("ai_radio"):
+            self.navigation_view.pop_to_tag("ai_radio")
+            self._refresh_ai_radio_state()
+            return
+
+        page = HTAIRadioPage()
+        page.connect("generate", self._on_page_generate_radio)
+        page.connect("refine", self.on_refine_radio)
+        page.connect("cancel-generate", self._on_ai_cancel_generate)
+        self.ai_radio_page = page
+        page.load()
+        self._refresh_ai_radio_state()
+        self.navigation_view.push(page)
+
+    def _refresh_ai_radio_state(self) -> None:
+        if not self.ai_radio_page:
+            return
         provider = self.settings.get_string("ai-provider")
         if provider != "ollama":
             api_key = self.secret_store.read_ai_key(provider)
             if not api_key:
-                utils.send_toast(_("Set your AI provider key in Preferences"), 3)
+                self.ai_radio_page.show_setup_state()
                 return
+        self.ai_radio_page.show_prompt_state()
 
-        dialog = HTAIRadioDialog()
-        dialog.connect("generate", self.on_generate_radio)
-        dialog.connect("closed", self._on_ai_dialog_closed)
-        self._ai_dialog = dialog
-        dialog.present(self)
-
-    def _on_ai_dialog_closed(self, dialog):
+    def _on_ai_cancel_generate(self, page) -> None:
+        self.ai_generation_id += 1
         if self.ai_cancel_event:
             self.ai_cancel_event.set()
-        self._ai_dialog = None
 
-    def on_generate_radio(self, dialog, prompt: str, use_playlists: bool):
+    def _on_page_generate_radio(self, page, prompt: str, use_playlists: bool) -> None:
         if self.ai_cancel_event:
             self.ai_cancel_event.set()
 
@@ -924,28 +936,17 @@ class HighTideWindow(Adw.ApplicationWindow):
             return
         if not tracks:
             utils.send_toast(_("No tracks found — try a different prompt"), 4)
-            if self._ai_dialog:
-                self._ai_dialog.reset()
+            if self.ai_radio_page:
+                self.ai_radio_page.set_loading(False)
             return
-        if (
-            self.ai_radio_page is not None
-            and self.navigation_view.get_visible_page() is self.ai_radio_page
-        ):
+        if self.ai_radio_page:
             self.ai_radio_page.update_tracks(title, tracks, suggestions, history)
-        else:
-            page = HTAIRadioPage(prompt, title, tracks, suggestions, history)
-            page.connect("refine", self.on_refine_radio)
-            self.ai_radio_page = page
-            page.load()
-            self.navigation_view.push(page)
-            if self._ai_dialog:
-                self._ai_dialog.close()
 
     def _on_radio_error(self, gen, error_bucket, provider=""):
         if gen != self.ai_generation_id:
             return
-        if self._ai_dialog:
-            self._ai_dialog.reset()
+        if self.ai_radio_page:
+            self.ai_radio_page.set_loading(False)
         match error_bucket:
             case "auth":
                 utils.send_toast(_("Invalid API key — check AI Radio settings"), 5)

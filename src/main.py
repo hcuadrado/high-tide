@@ -270,8 +270,16 @@ class HighTideApplication(Adw.Application):
             )
 
             self.preferences = builder.get_object("_preference_window")
+            self.preferences.connect("closed", self._on_preferences_closed)
 
         self.preferences.present(self.win)
+
+    def _on_preferences_closed(self, window) -> None:
+        if self._ai_key_timer:
+            GLib.source_remove(self._ai_key_timer)
+            self._ai_key_timer = None
+            self._do_save_ai_key()
+        self.win._refresh_ai_radio_state()
 
     def on_quality_changed(self, widget: Any, *args) -> None:
         self.win.select_quality(widget.get_selected())
@@ -325,6 +333,11 @@ class HighTideApplication(Adw.Application):
             except Exception:
                 logger.exception("Failed to save AI API key")
                 utils.send_toast(_("Could not save API key to keyring"), 3)
+        else:
+            try:
+                self.win.secret_store.clear_ai_key(provider)
+            except Exception:
+                logger.exception("Failed to clear AI API key")
         return GLib.SOURCE_REMOVE
 
     def deactive_alsa_device_row(self, widget: Any, *args) -> None:
