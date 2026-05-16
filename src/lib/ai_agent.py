@@ -9,6 +9,7 @@ from gettext import gettext as _
 
 from tidalapi.media import Track
 from tidalapi.artist import Artist
+from tidalapi.exceptions import MetadataNotAvailable, ObjectNotFound
 
 from . import utils
 from .ai_providers import (
@@ -28,6 +29,7 @@ _SYSTEM_PROMPT = (
     '  "title": "Human-readable radio title",\n'
     '  "strategy": "search",\n'
     '  "search_queries": ["query1", "query2"],\n'
+    '  "familiar_artist_picks": ["Artist Name"],\n'
     '  "playlist_names": [],\n'
     '  "suggestions": ["More energetic", "Earlier era", "Add more variety", "Slower tempo"],\n'
     '  "quality_criteria": {\n'
@@ -38,11 +40,18 @@ _SYSTEM_PROMPT = (
     "}\n\n"
     "Rules:\n"
     "- Maximum 5 search_queries\n"
+    "- familiar_artist_picks: up to 3 artist names chosen from the user's favourite "
+    "artists that genuinely match the requested vibe. Pick artists from DIFFERENT "
+    "genres/styles to maximize variety — avoid stacking three picks from the same "
+    "genre, since each pick seeds ~30 tracks from its style. These become seeds "
+    "alongside search_queries. Omit or leave empty [] if no favourite artist fits.\n"
     "- Maximum 3 playlist_names (use names from user context when strategy is playlist)\n"
     "- Maximum 4 suggestions — phrase as follow-up instructions, not descriptions\n"
     '- quality_criteria.decade: format "1990s" / "2000s", or "" if not applicable\n'
     '- quality_criteria.energy: "high" / "medium" / "low", or ""\n'
-    "- quality_criteria.genres: list of genre strings"
+    "- quality_criteria.genres: list of genre strings\n"
+    "- On refinement turns, return at least 3 search_queries — broaden where needed "
+    "rather than narrowing to one."
 )
 
 _MAX_HISTORY_TURNS = 8
@@ -90,15 +99,44 @@ def _parse_response(text: str) -> dict:
             raise ValueError(f"Missing required key: {key}")
 
     data["search_queries"] = data.get("search_queries", [])[:5]
+    data["familiar_artist_picks"] = [
+        p for p in data.get("familiar_artist_picks", []) if isinstance(p, str)
+    ][:3]
     data["playlist_names"] = data.get("playlist_names", [])[:3]
     data["suggestions"] = data.get("suggestions", [])[:4]
     logger.debug(
-        "Parsed response: title=%r queries=%s playlists=%s",
+        "Parsed response: title=%r queries=%s familiar_picks=%s playlists=%s",
         data.get("title"),
         data["search_queries"],
+        data["familiar_artist_picks"],
         data["playlist_names"],
     )
     return data
+
+
+def _build_taste_profile(
+    playlists=None,
+    favourite_artists=None,
+    favourite_tracks=None,
+) -> dict:
+    """Extract user taste data into a structured dict.
+
+    Kept separate from formatting so Phase 2 can cache and reuse this dict
+    without rebuilding it on every generate_radio call.
+    """
+    return {
+        "artist_names": [
+            a.name for a in (favourite_artists or [])[:20] if hasattr(a, "name")
+        ],
+        "track_entries": [
+            f"{t.name} by {t.artist.name}"
+            for t in (favourite_tracks or [])[:30]
+            if hasattr(t, "name") and hasattr(t, "artist") and t.artist
+        ],
+        "playlist_names": [
+            p.name for p in (playlists or []) if hasattr(p, "name")
+        ],
+    }
 
 
 def _build_user_message(
@@ -107,27 +145,14 @@ def _build_user_message(
     favourite_artists=None,
     favourite_tracks=None,
 ) -> str:
+    profile = _build_taste_profile(playlists, favourite_artists, favourite_tracks)
     parts = [f"Request: {prompt}"]
-
-    if favourite_artists:
-        names = [a.name for a in favourite_artists[:20] if hasattr(a, "name")]
-        if names:
-            parts.append(f"Favourite artists: {', '.join(names)}")
-
-    if favourite_tracks:
-        entries = [
-            f"{t.name} by {t.artist.name}"
-            for t in favourite_tracks[:30]
-            if hasattr(t, "name") and hasattr(t, "artist") and t.artist
-        ]
-        if entries:
-            parts.append(f"Favourite tracks: {', '.join(entries)}")
-
-    if playlists:
-        pl_names = [p.name for p in playlists if hasattr(p, "name")]
-        if pl_names:
-            parts.append(f"User playlists: {', '.join(pl_names)}")
-
+    if profile["artist_names"]:
+        parts.append(f"Favourite artists: {', '.join(profile['artist_names'])}")
+    if profile["track_entries"]:
+        parts.append(f"Favourite tracks: {', '.join(profile['track_entries'])}")
+    if profile["playlist_names"]:
+        parts.append(f"User playlists: {', '.join(profile['playlist_names'])}")
     return "\n\n".join(parts)
 
 
@@ -135,9 +160,31 @@ def _resolve_seeds(
     search_queries: list,
     playlist_names: list,
     cancel_event: threading.Event,
+    familiar_artist_picks: list | None = None,
 ) -> list:
     seeds = []
     seen_ids: set = set()
+
+    # Resolve familiar picks first so they survive the 5-seed cap.
+    fav_by_name = {
+        a.name.lower(): a
+        for a in utils.favourite_artists
+        if hasattr(a, "name") and hasattr(a, "id")
+    }
+    for name in (familiar_artist_picks or [])[:3]:
+        if cancel_event.is_set():
+            break
+        name_lower = name.lower()
+        match = fav_by_name.get(name_lower) or next(
+            (a for a in utils.favourite_artists if hasattr(a, "name") and name_lower in a.name.lower()),
+            None,
+        )
+        if match is not None and match.id not in seen_ids:
+            logger.debug("Familiar pick %r → artist id=%s", name, match.id)
+            seeds.append(match)
+            seen_ids.add(match.id)
+        else:
+            logger.debug("Familiar pick %r → no match in favourite_artists", name)
 
     for query in search_queries[:5]:
         if cancel_event.is_set():
@@ -146,12 +193,27 @@ def _resolve_seeds(
             results = utils.session.search(query, [Track, Artist], limit=5)
             seed = None
             top_hit = results.get("top_hit")
-            if isinstance(top_hit, (Track, Artist)):
+            artists = results.get("artists") or []
+            # Prefer Artist seeds — their radio mixes are far more reliable than
+            # track radio, which frequently raises MetadataNotAvailable.
+            if isinstance(top_hit, Track) and artists:
+                candidate = artists[0]
+                if (
+                    top_hit.artist
+                    and hasattr(top_hit.artist, "id")
+                    and hasattr(candidate, "id")
+                    and top_hit.artist.id == candidate.id
+                ):
+                    seed = candidate
+                    logger.debug("Query %r: promoted Artist over Track top_hit", query)
+                else:
+                    seed = top_hit
+            elif isinstance(top_hit, (Track, Artist)):
                 seed = top_hit
+            elif artists:
+                seed = artists[0]
             elif results.get("tracks"):
                 seed = results["tracks"][0]
-            elif results.get("artists"):
-                seed = results["artists"][0]
 
             if seed is not None and seed.id not in seen_ids:
                 logger.debug("Query %r → seed %s id=%s", query, type(seed).__name__, seed.id)
@@ -169,65 +231,144 @@ def _resolve_seeds(
             if hasattr(playlist, "name") and playlist.name == name:
                 try:
                     pl_tracks = list(playlist.tracks())
-                    if pl_tracks and pl_tracks[0].id not in seen_ids:
-                        seeds.append(pl_tracks[0])
-                        seen_ids.add(pl_tracks[0].id)
+                    added = 0
+                    for pt in pl_tracks[:3]:
+                        if pt.id not in seen_ids:
+                            seeds.append(pt)
+                            seen_ids.add(pt.id)
+                            added += 1
+                    logger.debug("Playlist %r → %d seed tracks", name, added)
                 except Exception:
                     logger.exception("Failed to load playlist: %s", name)
                 break
 
+    # Pad with favourite artists when fewer than 3 seeds resolved.
+    if len(seeds) < 3:
+        logger.debug("Seed top-up: %d seeds resolved, padding from favourite_artists", len(seeds))
+        for artist in utils.favourite_artists:
+            if len(seeds) >= 5:
+                break
+            if hasattr(artist, "id") and artist.id not in seen_ids:
+                seeds.append(artist)
+                seen_ids.add(artist.id)
+
     result = seeds[:5]
-    logger.debug("Resolved %d seeds (capped from %d) from %d queries + %d playlist names", len(result), len(seeds), len(search_queries), len(playlist_names))
+    logger.debug(
+        "Resolved %d seeds from %d queries + %d playlist names + familiar picks",
+        len(result), len(search_queries), len(playlist_names),
+    )
     return result
+
+
+_PER_SEED_LIMIT = 40
+_PER_ARTIST_LIMIT = 4
+_TOTAL_LIMIT = 100
+
+
+def _fetch_seed_pool(
+    seed,
+    cancel_event: threading.Event,
+    fallback: list,
+    fetched_artist_ids: set,
+) -> list:
+    """Return up to _PER_SEED_LIMIT tracks from a seed, with graceful fallbacks."""
+    if cancel_event.is_set() or not isinstance(seed, (Track, Artist)):
+        return []
+    try:
+        mix = seed.get_radio_mix()
+        tracks = list(mix.items())[:_PER_SEED_LIMIT]
+        artist_id = seed.id if isinstance(seed, Artist) else (
+            seed.artist.id if seed.artist and hasattr(seed.artist, "id") else None
+        )
+        if artist_id:
+            fetched_artist_ids.add(artist_id)
+        return tracks
+    except (MetadataNotAvailable, ObjectNotFound):
+        logger.debug("Radio mix not available for seed %s", seed.id)
+    except Exception:
+        logger.warning("get_radio_mix failed for seed %s", seed.id, exc_info=True)
+
+    if isinstance(seed, Track) and seed.artist:
+        artist_id = seed.artist.id if hasattr(seed.artist, "id") else None
+        if artist_id and artist_id not in fetched_artist_ids:
+            try:
+                mix = seed.artist.get_radio_mix()
+                tracks = list(mix.items())[:_PER_SEED_LIMIT]
+                fetched_artist_ids.add(artist_id)
+                logger.debug("Artist radio fallback for track seed %s: %d tracks", seed.id, len(tracks))
+                return tracks
+            except (MetadataNotAvailable, ObjectNotFound):
+                logger.debug("Artist radio not available for track seed %s", seed.id)
+            except Exception:
+                logger.warning("Artist radio fallback failed for seed %s", seed.id, exc_info=True)
+        # Final fallback: artist top tracks (more reliable than track radio)
+        try:
+            top = list(seed.artist.get_top_tracks())[:20]
+            logger.debug("Artist top_tracks fallback for track seed %s: %d tracks", seed.id, len(top))
+            return top
+        except Exception:
+            logger.debug("Artist top_tracks fallback failed for track seed %s", seed.id)
+        fallback.append(seed)
+    elif isinstance(seed, Artist):
+        try:
+            top = list(seed.get_top_tracks())[:20]
+            logger.debug("Artist top_tracks fallback for seed %s: %d tracks", seed.id, len(top))
+            return top
+        except Exception:
+            logger.debug("Artist top_tracks fallback failed for seed %s", seed.id)
+    return []
 
 
 def _get_radio_tracks(seeds: list, cancel_event: threading.Event) -> list:
-    all_tracks: list = []
-    seen_ids: set = set()
     fallback: list = []
-
+    fetched_artist_ids: set = set()
+    per_seed_pools: list[list] = []
     for seed in seeds:
         if cancel_event.is_set():
             break
-        if not isinstance(seed, (Track, Artist)):
-            continue
-        try:
-            mix = seed.get_radio_mix()
-            before = len(all_tracks)
-            for track in list(mix.items())[:100]:
-                if hasattr(track, "id") and track.id not in seen_ids:
-                    all_tracks.append(track)
-                    seen_ids.add(track.id)
-            logger.debug("Seed %s added %d tracks", seed.id, len(all_tracks) - before)
-        except Exception:
-            logger.exception("get_radio_mix failed for seed %s", seed.id)
-            if isinstance(seed, Track) and seed.artist:
-                # Try the track's artist radio before giving up
-                try:
-                    mix = seed.artist.get_radio_mix()
-                    before = len(all_tracks)
-                    for track in list(mix.items())[:100]:
-                        if hasattr(track, "id") and track.id not in seen_ids:
-                            all_tracks.append(track)
-                            seen_ids.add(track.id)
-                    logger.debug("Artist fallback for track seed %s added %d tracks", seed.id, len(all_tracks) - before)
-                except Exception:
-                    logger.debug("Artist fallback also failed for track seed %s, using track itself", seed.id)
-                    fallback.append(seed)
-            elif isinstance(seed, Artist):
-                # Artist radio failed — use top tracks as fallback pool
-                try:
-                    top = [t for t in list(seed.get_top_tracks())[:20] if hasattr(t, "id") and t.id not in seen_ids]
-                    for t in top:
-                        seen_ids.add(t.id)
-                    fallback.extend(top)
-                    logger.debug("Artist top_tracks fallback for seed %s: %d tracks", seed.id, len(top))
-                except Exception:
-                    logger.debug("Artist top_tracks fallback failed for seed %s", seed.id)
+        pool = _fetch_seed_pool(seed, cancel_event, fallback, fetched_artist_ids)
+        if pool:
+            per_seed_pools.append(pool)
+            logger.debug("Seed %s pool: %d tracks", seed.id, len(pool))
 
-    result = all_tracks[:100] if all_tracks else fallback[:100]
-    logger.debug("Total radio tracks: %d (fallback=%s)", len(result), not all_tracks)
-    return result
+    # Round-robin merge with per-artist cap so no single seed (or artist) dominates.
+    result: list = []
+    seen_ids: set = set()
+    artist_counts: dict = {}
+    cursors = [0] * len(per_seed_pools)
+
+    while len(result) < _TOTAL_LIMIT:
+        progressed = False
+        for i, pool in enumerate(per_seed_pools):
+            if cursors[i] >= len(pool):
+                continue
+            track = pool[cursors[i]]
+            cursors[i] += 1
+            progressed = True
+            if not hasattr(track, "id") or track.id in seen_ids:
+                continue
+            artist_id = (
+                track.artist.id
+                if track.artist and hasattr(track.artist, "id")
+                else None
+            )
+            if artist_id is not None and artist_counts.get(artist_id, 0) >= _PER_ARTIST_LIMIT:
+                continue
+            result.append(track)
+            seen_ids.add(track.id)
+            if artist_id is not None:
+                artist_counts[artist_id] = artist_counts.get(artist_id, 0) + 1
+            if len(result) >= _TOTAL_LIMIT:
+                break
+        if not progressed:
+            break
+
+    final = result if result else fallback[:_TOTAL_LIMIT]
+    logger.debug(
+        "Total radio tracks: %d (fallback=%s, distinct artists=%d)",
+        len(final), not result, len(artist_counts),
+    )
+    return final
 
 
 def _decade_prefilter(tracks: list, quality_criteria: dict) -> list:
@@ -249,6 +390,83 @@ def _decade_prefilter(tracks: list, quality_criteria: dict) -> list:
     ]
     logger.debug("Decade filter %s: %d → %d tracks", decade_str, len(tracks), len(filtered) if filtered else len(tracks))
     return filtered if filtered else tracks
+
+
+def _familiar_blend(tracks: list, seeds: list, target_ratio: float = 0.4) -> list:
+    fav_artist_ids = {a.id for a in utils.favourite_artists if hasattr(a, "id")}
+    fav_track_ids = {t.id for t in utils.favourite_tracks if hasattr(t, "id")}
+
+    def is_familiar(track) -> bool:
+        if not hasattr(track, "id"):
+            return False
+        if track.id in fav_track_ids:
+            return True
+        if track.artist and hasattr(track.artist, "id") and track.artist.id in fav_artist_ids:
+            return True
+        for a in getattr(track, "artists", None) or []:
+            if hasattr(a, "id") and a.id in fav_artist_ids:
+                return True
+        return False
+
+    familiar = [t for t in tracks if is_familiar(t)]
+    unfamiliar = [t for t in tracks if not is_familiar(t)]
+    cap = min(len(tracks), 60)
+    target_count = round(cap * target_ratio)
+
+    logger.debug(
+        "Blend: %d familiar / %d unfamiliar from %d tracks, target=%d familiar in cap=%d",
+        len(familiar), len(unfamiliar), len(tracks), target_count, cap,
+    )
+
+    # Supplement familiar bucket from favourites when short.
+    if len(familiar) < target_count:
+        seed_artist_ids: set = set()
+        for s in seeds:
+            if isinstance(s, Artist) and hasattr(s, "id"):
+                seed_artist_ids.add(s.id)
+            elif isinstance(s, Track) and s.artist and hasattr(s.artist, "id"):
+                seed_artist_ids.add(s.artist.id)
+
+        existing_ids = {t.id for t in tracks if hasattr(t, "id")}
+        candidates = [
+            t for t in utils.favourite_tracks
+            if hasattr(t, "id") and t.id not in existing_ids
+            and hasattr(t, "artist") and t.artist
+        ]
+        primary = [t for t in candidates if hasattr(t.artist, "id") and t.artist.id in seed_artist_ids]
+        secondary = [t for t in candidates if not (hasattr(t.artist, "id") and t.artist.id in seed_artist_ids)]
+        supplement = (primary + secondary)[:target_count - len(familiar)]
+        familiar.extend(supplement)
+        logger.debug("Supplemented familiar with %d favourite tracks", len(supplement))
+
+    # Interleave: distribute familiar at ~target_ratio spacing, preserving bucket order.
+    familiar_needed = min(target_count, len(familiar))
+    unfamiliar_needed = min(cap - familiar_needed, len(unfamiliar))
+    result: list = []
+    fi = ui = 0
+    credit = 0.0
+    for _i in range(familiar_needed + unfamiliar_needed):
+        credit += target_ratio
+        if credit >= 1.0 and fi < familiar_needed:
+            result.append(familiar[fi])
+            fi += 1
+            credit -= 1.0
+        elif ui < unfamiliar_needed:
+            result.append(unfamiliar[ui])
+            ui += 1
+        elif fi < familiar_needed:
+            result.append(familiar[fi])
+            fi += 1
+        else:
+            break
+
+    logger.debug(
+        "Blend result: %d tracks (%d familiar, %d unfamiliar)",
+        len(result),
+        sum(1 for t in result if is_familiar(t)),
+        sum(1 for t in result if not is_familiar(t)),
+    )
+    return result
 
 
 def _critic_filter(
@@ -364,6 +582,7 @@ def generate_radio(
     data = _parse_response(raw)
     title = data.get("title", _("AI Radio"))
     search_queries = data["search_queries"]
+    familiar_artist_picks = data.get("familiar_artist_picks", [])
     playlist_names = data.get("playlist_names", [])
     suggestions = data.get("suggestions", [])
     quality_criteria = data.get("quality_criteria", {})
@@ -371,7 +590,7 @@ def generate_radio(
     if cancel_event.is_set():
         raise InterruptedError("Cancelled")
 
-    seeds = _resolve_seeds(search_queries, playlist_names, cancel_event)
+    seeds = _resolve_seeds(search_queries, playlist_names, cancel_event, familiar_artist_picks)
 
     if cancel_event.is_set():
         raise InterruptedError("Cancelled")
@@ -381,8 +600,9 @@ def generate_radio(
     if quality_criteria:
         tracks = _decade_prefilter(tracks, quality_criteria)
 
-    # Critic pass: only on first generation (no history), when opted in
-    if use_critic and not history:
+    tracks = _familiar_blend(tracks, seeds)
+
+    if use_critic:
         tracks = _critic_filter(
             prompt,
             quality_criteria,

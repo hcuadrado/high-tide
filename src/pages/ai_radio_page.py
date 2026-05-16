@@ -21,7 +21,7 @@ class HTAIRadioPage(Page):
     __gtype_name__ = "HTAIRadioPage"
 
     __gsignals__ = {
-        "generate": (GObject.SignalFlags.RUN_FIRST, None, (str, bool)),
+        "generate": (GObject.SignalFlags.RUN_FIRST, None, (str,)),
         "refine": (GObject.SignalFlags.RUN_FIRST, None, (str, GObject.TYPE_PYOBJECT)),
         "cancel-generate": (GObject.SignalFlags.RUN_FIRST, None, ()),
     }
@@ -39,7 +39,6 @@ class HTAIRadioPage(Page):
 
         self._state_stack: Gtk.Stack | None = None
         self._prompt_entry: Adw.EntryRow | None = None
-        self._use_playlists_row: Adw.SwitchRow | None = None
         self._chips_box: Gtk.Box | None = None
         self._chip_signals: list = []
         self._auto_load: HTAutoLoadWidget | None = None
@@ -64,6 +63,7 @@ class HTAIRadioPage(Page):
         self._state_stack = Gtk.Stack(
             transition_type=Gtk.StackTransitionType.CROSSFADE,
             vexpand=True,
+            vhomogeneous=False,
         )
         self._state_stack.add_named(self._build_setup_view(), "setup")
         self._state_stack.add_named(self._build_prompt_view(), "prompt")
@@ -121,16 +121,6 @@ class HTAIRadioPage(Page):
         )
         prompt_list.append(self._prompt_entry)
 
-        self._use_playlists_row = Adw.SwitchRow(
-            title=_("Use my playlists as context"),
-            subtitle=_("Sends your playlist names to the AI provider"),
-        )
-        options_list = Gtk.ListBox(
-            selection_mode=Gtk.SelectionMode.NONE,
-            css_classes=["boxed-list"],
-        )
-        options_list.append(self._use_playlists_row)
-
         generate_btn = Gtk.Button(
             label=_("Generate"),
             halign=Gtk.Align.CENTER,
@@ -157,7 +147,6 @@ class HTAIRadioPage(Page):
         self._prompt_entry.add_controller(key_ctrl)
 
         box.append(prompt_list)
-        box.append(options_list)
         box.append(generate_btn)
         return box
 
@@ -274,9 +263,8 @@ class HTAIRadioPage(Page):
         prompt = self._prompt_entry.get_text().strip()
         if not prompt:
             return
-        use_playlists = self._use_playlists_row.get_active()
         self.set_loading(True)
-        self.emit("generate", prompt, use_playlists)
+        self.emit("generate", prompt)
 
     def _on_cancel_clicked(self, *args) -> None:
         self.emit("cancel-generate")
@@ -388,6 +376,8 @@ class HTAIRadioPage(Page):
             self._state_stack.set_visible_child_name("loading")
             if self._bottom_bar:
                 self._bottom_bar.set_visible(False)
+            if self.scrolled_window:
+                self.scrolled_window.get_vadjustment().set_value(0)
         else:
             target = self._pre_loading_state if self._tracks else "prompt"
             self._state_stack.set_visible_child_name(target)

@@ -845,7 +845,7 @@ class HighTideWindow(Adw.ApplicationWindow):
         if self.ai_cancel_event:
             self.ai_cancel_event.set()
 
-    def _on_page_generate_radio(self, page, prompt: str, use_playlists: bool) -> None:
+    def _on_page_generate_radio(self, page, prompt: str) -> None:
         if self.ai_cancel_event:
             self.ai_cancel_event.set()
 
@@ -859,7 +859,7 @@ class HighTideWindow(Adw.ApplicationWindow):
         base_url = self.settings.get_string("ai-ollama-url")
         use_critic = self.settings.get_boolean("ai-use-critic-filter")
 
-        playlists = list(utils.user_playlists) if use_playlists else []
+        playlists = list(utils.user_playlists) + list(utils.favourite_playlists)
         fav_artists = list(utils.favourite_artists)
         fav_tracks = list(utils.favourite_tracks)
 
