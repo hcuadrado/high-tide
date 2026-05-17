@@ -25,6 +25,7 @@ from typing import Any, Callable, List
 from gi.repository import Adw, Gio, GLib, Gtk
 
 from .lib import utils
+from .lib.ai_providers import PROVIDER_DEFAULTS
 from .lib.player_object import AudioSink
 from .window import HighTideWindow
 
@@ -66,6 +67,7 @@ class HighTideApplication(Adw.Application):
         self._ai_loading_key: bool = False
         self._ai_provider_row: Adw.ComboRow | None = None
         self._ai_api_key_row: Adw.PasswordEntryRow | None = None
+        self._ai_model_row: Adw.EntryRow | None = None
         self._ai_ollama_url_row: Adw.EntryRow | None = None
 
     def do_open(self, files: List[Gio.File], n_files: int, hint: str) -> None:
@@ -228,7 +230,7 @@ class HighTideApplication(Adw.Application):
             # AI Radio settings
             self._ai_provider_row = builder.get_object("_ai_provider_row")
             self._ai_api_key_row = builder.get_object("_ai_api_key_row")
-            ai_model_row = builder.get_object("_ai_model_row")
+            self._ai_model_row = builder.get_object("_ai_model_row")
             self._ai_ollama_url_row = builder.get_object("_ai_ollama_url_row")
             ai_critic_row = builder.get_object("_ai_use_critic_row")
 
@@ -241,13 +243,15 @@ class HighTideApplication(Adw.Application):
             self._ai_provider_row.set_selected(provider_idx)
             self._ai_ollama_url_row.set_visible(current_provider == "ollama")
 
+            self._set_model_placeholder(current_provider)
+
             self._ai_loading_key = True
             key = self.win.secret_store.read_ai_key(current_provider) or ""
             self._ai_api_key_row.set_text(key)
             self._ai_loading_key = False
 
             self.settings.bind(
-                "ai-model", ai_model_row, "text", Gio.SettingsBindFlags.DEFAULT
+                "ai-model", self._ai_model_row, "text", Gio.SettingsBindFlags.DEFAULT
             )
             self.settings.bind(
                 "ai-ollama-url",
@@ -304,6 +308,15 @@ class HighTideApplication(Adw.Application):
     def on_discord_rpc_changed(self, widget: Any, *args) -> None:
         self.win.change_discord_rpc_enabled(widget.get_active())
 
+    def _set_model_placeholder(self, provider: str) -> None:
+        if not self._ai_model_row:
+            return
+        default_model = PROVIDER_DEFAULTS.get(provider, "")
+        # Adw.EntryRow shows title as the placeholder when the entry is empty.
+        # Setting it to the default model name means the user sees it without
+        # having to click, and it floats up as a label when a custom model is typed.
+        self._ai_model_row.set_title(default_model or _("Model Override"))
+
     def on_ai_provider_changed(self, row: Any, *args) -> None:
         idx = row.get_selected()
         if idx >= len(_AI_PROVIDERS):
@@ -311,6 +324,7 @@ class HighTideApplication(Adw.Application):
         provider = _AI_PROVIDERS[idx]
         self.settings.set_string("ai-provider", provider)
         self._ai_ollama_url_row.set_visible(provider == "ollama")
+        self._set_model_placeholder(provider)
         self._ai_loading_key = True
         key = self.win.secret_store.read_ai_key(provider) or ""
         self._ai_api_key_row.set_text(key)

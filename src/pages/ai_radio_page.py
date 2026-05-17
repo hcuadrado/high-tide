@@ -24,6 +24,7 @@ class HTAIRadioPage(Page):
         "generate": (GObject.SignalFlags.RUN_FIRST, None, (str,)),
         "refine": (GObject.SignalFlags.RUN_FIRST, None, (str, GObject.TYPE_PYOBJECT)),
         "cancel-generate": (GObject.SignalFlags.RUN_FIRST, None, ()),
+        "new-prompt": (GObject.SignalFlags.RUN_FIRST, None, ()),
     }
 
     def __init__(self) -> None:
@@ -33,9 +34,11 @@ class HTAIRadioPage(Page):
 
         self._history: list = []
         self._tracks: list = []
+        self._suggestions: list = []
         self._ai_title: str = ""
         self._initial_state: str = "prompt"
         self._pre_loading_state: str = "prompt"
+        self._restore_snapshot: dict | None = None
 
         self._state_stack: Gtk.Stack | None = None
         self._prompt_entry: Adw.EntryRow | None = None
@@ -45,6 +48,7 @@ class HTAIRadioPage(Page):
         self._refine_entry: Adw.EntryRow | None = None
         self._save_button: Gtk.Button | None = None
         self._bottom_bar: Gtk.ActionBar | None = None
+        self._new_prompt_btn: Gtk.Button | None = None
 
         # Must be added before the page is rendered to avoid layout loops.
         self._bottom_bar = self._build_bottom_bar()
@@ -71,6 +75,22 @@ class HTAIRadioPage(Page):
         self._state_stack.add_named(self._build_results_view(), "results")
         self._state_stack.set_visible_child_name(self._initial_state)
         self.append(self._state_stack)
+
+        if self.header_bar:
+            self._new_prompt_btn = Gtk.Button(
+                icon_name="tab-new-symbolic",
+                tooltip_text=_("New prompt"),
+                visible=False,
+                valign=Gtk.Align.CENTER,
+            )
+            self.signals.append((self._new_prompt_btn, self._new_prompt_btn.connect(
+                "clicked", lambda *_: self.reset()
+            )))
+            self.header_bar.pack_start(self._new_prompt_btn)
+
+        if self._restore_snapshot:
+            self.update_tracks(**self._restore_snapshot)
+            self._restore_snapshot = None
 
     #
     #   VIEW BUILDERS
@@ -114,6 +134,7 @@ class HTAIRadioPage(Page):
 
         self._prompt_entry = Adw.EntryRow(
             title=_("Describe the music you want…"),
+            max_length=500,
         )
         prompt_list = Gtk.ListBox(
             selection_mode=Gtk.SelectionMode.NONE,
@@ -202,6 +223,7 @@ class HTAIRadioPage(Page):
         self._refine_entry = Adw.EntryRow(
             title=_("Refine: make it more upbeat…"),
             hexpand=True,
+            max_length=500,
         )
         refine_list = Gtk.ListBox(
             selection_mode=Gtk.SelectionMode.NONE,
@@ -216,7 +238,7 @@ class HTAIRadioPage(Page):
             icon_name="go-next-symbolic",
             sensitive=False,
             valign=Gtk.Align.CENTER,
-            css_classes=["flat", "circular"],
+            css_classes=["circular", "suggested-action"],
         )
         self.signals.append((refine_btn, refine_btn.connect(
             "clicked", lambda *_: self._on_refine_submit()
@@ -352,6 +374,8 @@ class HTAIRadioPage(Page):
             self._state_stack.set_visible_child_name("setup")
         if self._bottom_bar:
             self._bottom_bar.set_visible(False)
+        if self._new_prompt_btn:
+            self._new_prompt_btn.set_visible(False)
 
     def show_prompt_state(self) -> None:
         # Don't reset to prompt when results are already showing.
@@ -367,6 +391,8 @@ class HTAIRadioPage(Page):
             self._state_stack.set_visible_child_name("prompt")
         if self._bottom_bar:
             self._bottom_bar.set_visible(False)
+        if self._new_prompt_btn:
+            self._new_prompt_btn.set_visible(False)
 
     def set_loading(self, loading: bool) -> None:
         if not self._state_stack:
@@ -376,6 +402,8 @@ class HTAIRadioPage(Page):
             self._state_stack.set_visible_child_name("loading")
             if self._bottom_bar:
                 self._bottom_bar.set_visible(False)
+            if self._new_prompt_btn:
+                self._new_prompt_btn.set_visible(True)
             if self.scrolled_window:
                 self.scrolled_window.get_vadjustment().set_value(0)
         else:
@@ -383,6 +411,8 @@ class HTAIRadioPage(Page):
             self._state_stack.set_visible_child_name(target)
             if self._bottom_bar:
                 self._bottom_bar.set_visible(target == "results")
+            if self._new_prompt_btn:
+                self._new_prompt_btn.set_visible(target == "results")
 
     def update_tracks(
         self,
@@ -393,6 +423,7 @@ class HTAIRadioPage(Page):
     ) -> None:
         self._ai_title = title
         self._tracks = tracks
+        self._suggestions = list(suggestions)
         self._history = history
         self.set_title(title)
 
@@ -411,5 +442,42 @@ class HTAIRadioPage(Page):
                 self._state_stack.set_visible_child_name("results")
             if self._bottom_bar:
                 self._bottom_bar.set_visible(True)
+            if self._new_prompt_btn:
+                self._new_prompt_btn.set_visible(True)
 
         GLib.idle_add(_show_results)
+
+    def get_state(self) -> dict | None:
+        current = (
+            self._state_stack.get_visible_child_name()
+            if self._state_stack
+            else self._initial_state
+        )
+        if current != "results":
+            return None
+        return {
+            "title": self._ai_title,
+            "tracks": list(self._tracks),
+            "suggestions": list(self._suggestions),
+            "history": list(self._history),
+        }
+
+    def reset(self) -> None:
+        self._history = []
+        self._tracks = []
+        self._suggestions = []
+        self._ai_title = ""
+        if self._prompt_entry:
+            self._prompt_entry.set_text("")
+        if self._refine_entry:
+            self._refine_entry.set_text("")
+        if self._chips_box:
+            self._populate_chips([])
+        self._initial_state = "prompt"
+        if self._state_stack:
+            self._state_stack.set_visible_child_name("prompt")
+        if self._bottom_bar:
+            self._bottom_bar.set_visible(False)
+        if self._new_prompt_btn:
+            self._new_prompt_btn.set_visible(False)
+        self.emit("new-prompt")

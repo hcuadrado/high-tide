@@ -204,6 +204,7 @@ class HighTideWindow(Adw.ApplicationWindow):
         self.ai_generation_id: int = 0
         self.ai_cancel_event: threading.Event | None = None
         self.ai_radio_page: HTAIRadioPage | None = None
+        self.ai_radio_snapshot: dict | None = None
 
         self.videoplayer = Gtk.MediaFile.new()
 
@@ -629,6 +630,7 @@ class HighTideWindow(Adw.ApplicationWindow):
     def on_navigation_view_page_popped_func(self, nav_view, nav_page):
         nav_page.disconnect_all()
         if nav_page is self.ai_radio_page:
+            self.ai_radio_snapshot = self.ai_radio_page.get_state()
             self.ai_radio_page = None
             if self.ai_cancel_event:
                 self.ai_cancel_event.set()
@@ -824,10 +826,18 @@ class HighTideWindow(Adw.ApplicationWindow):
         page.connect("generate", self._on_page_generate_radio)
         page.connect("refine", self.on_refine_radio)
         page.connect("cancel-generate", self._on_ai_cancel_generate)
+        page.connect("new-prompt", self._on_ai_radio_new_prompt)
+        if self.ai_radio_snapshot:
+            page._restore_snapshot = self.ai_radio_snapshot
         self.ai_radio_page = page
         page.load()
         self._refresh_ai_radio_state()
         self.navigation_view.push(page)
+
+    def _on_ai_radio_new_prompt(self, page) -> None:
+        self.ai_radio_snapshot = None
+        if self.ai_cancel_event:
+            self.ai_cancel_event.set()
 
     def _refresh_ai_radio_state(self) -> None:
         if not self.ai_radio_page:
