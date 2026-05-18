@@ -6,6 +6,13 @@
   border-radius: 60px;
 }
 
+.ai-chip {
+  padding: 4px 6px;
+  min-height: 0;
+  font-size: 0.85em;
+  border-radius: 60px;
+}
+
 .card-image {
   border-radius: 10px;
 }

@@ -45,14 +45,14 @@ class HTAIRadioPage(Page):
         self._chips_box: Gtk.Box | None = None
         self._chip_signals: list = []
         self._auto_load: HTAutoLoadWidget | None = None
-        self._refine_entry: Adw.EntryRow | None = None
+        self._refine_entry: Gtk.Entry | None = None
         self._save_button: Gtk.Button | None = None
-        self._bottom_bar: Gtk.ActionBar | None = None
         self._new_prompt_btn: Gtk.Button | None = None
-
-        # Must be added before the page is rendered to avoid layout loops.
-        self._bottom_bar = self._build_bottom_bar()
-        self.object.add_bottom_bar(self._bottom_bar)
+        self._play_btn: Gtk.Button | None = None
+        self._shuffle_btn: Gtk.Button | None = None
+        self._title_label: Gtk.Label | None = None
+        self._first_subtitle_label: Gtk.Label | None = None
+        self._second_subtitle_label: Gtk.Label | None = None
 
     def disconnect_all(self) -> None:
         for chip, handler_id in self._chip_signals:
@@ -75,18 +75,6 @@ class HTAIRadioPage(Page):
         self._state_stack.add_named(self._build_results_view(), "results")
         self._state_stack.set_visible_child_name(self._initial_state)
         self.append(self._state_stack)
-
-        if self.header_bar:
-            self._new_prompt_btn = Gtk.Button(
-                icon_name="tab-new-symbolic",
-                tooltip_text=_("New prompt"),
-                visible=False,
-                valign=Gtk.Align.CENTER,
-            )
-            self.signals.append((self._new_prompt_btn, self._new_prompt_btn.connect(
-                "clicked", lambda *_: self.reset()
-            )))
-            self.header_bar.pack_start(self._new_prompt_btn)
 
         if self._restore_snapshot:
             self.update_tracks(**self._restore_snapshot)
@@ -198,42 +186,109 @@ class HTAIRadioPage(Page):
     def _build_results_view(self) -> Gtk.Widget:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
 
+        # Header — title/subtitles on the left, action buttons on the right
+        header = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            margin_start=12,
+            margin_end=12,
+            margin_top=12,
+            margin_bottom=8,
+            spacing=8,
+        )
+
+        info_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=2,
+            hexpand=True,
+            valign=Gtk.Align.CENTER,
+        )
+        self._title_label = Gtk.Label(
+            label="",
+            halign=Gtk.Align.START,
+            wrap=True,
+            css_classes=["title-2"],
+        )
+        self._first_subtitle_label = Gtk.Label(
+            label="",
+            halign=Gtk.Align.START,
+            wrap=True,
+            css_classes=["dim-label"],
+        )
+        self._second_subtitle_label = Gtk.Label(
+            label="",
+            halign=Gtk.Align.START,
+            css_classes=["dim-label", "caption"],
+        )
+        info_box.append(self._title_label)
+        info_box.append(self._first_subtitle_label)
+        info_box.append(self._second_subtitle_label)
+        header.append(info_box)
+
+        btn_box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=4,
+            valign=Gtk.Align.CENTER,
+        )
+        self._save_button = Gtk.Button(
+            label=_("Save"),
+            tooltip_text=_("Save as playlist"),
+            valign=Gtk.Align.CENTER,
+            css_classes=["flat", "pill"],
+        )
+        self._shuffle_btn = Gtk.Button(
+            icon_name="media-playlist-shuffle-symbolic",
+            tooltip_text=_("Shuffle"),
+            valign=Gtk.Align.CENTER,
+            css_classes=["flat", "pill"],
+        )
+        self._play_btn = Gtk.Button(
+            icon_name="media-playback-start-symbolic",
+            tooltip_text=_("Play"),
+            valign=Gtk.Align.CENTER,
+            css_classes=["suggested-action", "pill"],
+        )
+        self.signals.append((self._save_button, self._save_button.connect(
+            "clicked", self._on_save_clicked
+        )))
+        self.signals.append((self._shuffle_btn, self._shuffle_btn.connect(
+            "clicked", self._on_shuffle_clicked
+        )))
+        self.signals.append((self._play_btn, self._play_btn.connect(
+            "clicked", self._on_play_clicked
+        )))
+        btn_box.append(self._save_button)
+        btn_box.append(self._shuffle_btn)
+        btn_box.append(self._play_btn)
+        header.append(btn_box)
+        box.append(header)
+
+        # Suggestion chips
         self._chips_box = Gtk.FlowBox(
             selection_mode=Gtk.SelectionMode.NONE,
-            column_spacing=6,
-            row_spacing=6,
+            column_spacing=4,
+            row_spacing=4,
             max_children_per_line=100,
             margin_start=12,
             margin_end=12,
-            margin_top=8,
-            margin_bottom=4,
+            margin_top=0,
+            margin_bottom=2,
         )
         box.append(self._chips_box)
 
-        self._auto_load = HTAutoLoadWidget()
-        self._auto_load.set_scrolled_window(self.scrolled_window)
-        self.disconnectables.append(self._auto_load)
-        box.append(self._auto_load)
-
-        return box
-
-    def _build_bottom_bar(self) -> Gtk.ActionBar:
-        bar = Gtk.ActionBar(visible=False)
-
-        self._refine_entry = Adw.EntryRow(
-            title=_("Refine: make it more upbeat…"),
+        # Refine row: new-prompt button + entry + submit
+        self._new_prompt_btn = Gtk.Button(
+            label=_("New prompt"),
+            valign=Gtk.Align.CENTER,
+            css_classes=["flat", "pill"],
+        )
+        self.signals.append((self._new_prompt_btn, self._new_prompt_btn.connect(
+            "clicked", lambda *_: self.reset()
+        )))
+        self._refine_entry = Gtk.Entry(
+            placeholder_text=_("Refine: make it more upbeat…"),
             hexpand=True,
             max_length=500,
         )
-        refine_list = Gtk.ListBox(
-            selection_mode=Gtk.SelectionMode.NONE,
-            css_classes=["boxed-list"],
-            hexpand=True,
-            margin_start=6,
-            margin_end=6,
-        )
-        refine_list.append(self._refine_entry)
-
         refine_btn = Gtk.Button(
             icon_name="go-next-symbolic",
             sensitive=False,
@@ -249,33 +304,26 @@ class HTAIRadioPage(Page):
                 len(self._refine_entry.get_text().strip()) > 0
             ),
         )))
-        refine_key_ctrl = Gtk.EventControllerKey()
-        refine_key_ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        self.signals.append((refine_key_ctrl, refine_key_ctrl.connect(
-            "key-pressed",
-            lambda ctrl, keyval, _kc, _st: (
-                self._on_refine_submit() or True
-            ) if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) else False,
+        self.signals.append((self._refine_entry, self._refine_entry.connect(
+            "activate", lambda *_: self._on_refine_submit()
         )))
-        self._refine_entry.add_controller(refine_key_ctrl)
-
-        center_box = Gtk.Box(spacing=6, hexpand=True)
-        center_box.append(refine_list)
-        center_box.append(refine_btn)
-        bar.set_center_widget(center_box)
-
-        self._save_button = Gtk.Button(
-            label=_("Save"),
-            valign=Gtk.Align.CENTER,
-            css_classes=["suggested-action", "pill"],
-            margin_start=6,
+        refine_row = Gtk.Box(
+            spacing=6,
+            margin_start=12,
+            margin_end=12,
+            margin_bottom=8,
         )
-        self.signals.append((self._save_button, self._save_button.connect(
-            "clicked", self._on_save_clicked
-        )))
-        bar.pack_end(self._save_button)
+        refine_row.append(self._refine_entry)
+        refine_row.append(refine_btn)
+        refine_row.append(self._new_prompt_btn)
+        box.append(refine_row)
 
-        return bar
+        self._auto_load = HTAutoLoadWidget()
+        self._auto_load.set_scrolled_window(self.scrolled_window)
+        self.disconnectables.append(self._auto_load)
+        box.append(self._auto_load)
+
+        return box
 
     #
     #   EVENT HANDLERS
@@ -306,7 +354,7 @@ class HTAIRadioPage(Page):
         while self._chips_box.get_first_child():
             self._chips_box.remove(self._chips_box.get_first_child())
         for suggestion in suggestions:
-            chip = Gtk.Button(label=suggestion, css_classes=["pill"])
+            chip = Gtk.Button(label=suggestion, css_classes=["ai-chip"])
             handler_id = chip.connect("clicked", self._on_chip_clicked, suggestion)
             self._chip_signals.append((chip, handler_id))
             self._chips_box.append(chip)
@@ -314,6 +362,17 @@ class HTAIRadioPage(Page):
     def _on_chip_clicked(self, btn, suggestion: str) -> None:
         self._refine_entry.set_text(suggestion)
         self._on_refine_submit()
+
+    def _on_play_clicked(self, *args) -> None:
+        if self._tracks:
+            utils.player_object.play_this(self._tracks)
+
+    def _on_shuffle_clicked(self, *args) -> None:
+        if self._tracks:
+            utils.player_object.shuffle_this(self._tracks)
+
+    def _set_results_chrome_visible(self, visible: bool) -> None:
+        pass  # new-prompt btn lives inside the results stack child; no manual visibility needed
 
     #
     #   SAVE AS PLAYLIST
@@ -372,10 +431,7 @@ class HTAIRadioPage(Page):
         self._initial_state = "setup"
         if self._state_stack:
             self._state_stack.set_visible_child_name("setup")
-        if self._bottom_bar:
-            self._bottom_bar.set_visible(False)
-        if self._new_prompt_btn:
-            self._new_prompt_btn.set_visible(False)
+        self._set_results_chrome_visible(False)
 
     def show_prompt_state(self) -> None:
         # Don't reset to prompt when results are already showing.
@@ -389,10 +445,7 @@ class HTAIRadioPage(Page):
         self._initial_state = "prompt"
         if self._state_stack:
             self._state_stack.set_visible_child_name("prompt")
-        if self._bottom_bar:
-            self._bottom_bar.set_visible(False)
-        if self._new_prompt_btn:
-            self._new_prompt_btn.set_visible(False)
+        self._set_results_chrome_visible(False)
 
     def set_loading(self, loading: bool) -> None:
         if not self._state_stack:
@@ -400,19 +453,13 @@ class HTAIRadioPage(Page):
         if loading:
             self._pre_loading_state = self._state_stack.get_visible_child_name()
             self._state_stack.set_visible_child_name("loading")
-            if self._bottom_bar:
-                self._bottom_bar.set_visible(False)
-            if self._new_prompt_btn:
-                self._new_prompt_btn.set_visible(True)
+            self._set_results_chrome_visible(False)
             if self.scrolled_window:
                 self.scrolled_window.get_vadjustment().set_value(0)
         else:
             target = self._pre_loading_state if self._tracks else "prompt"
             self._state_stack.set_visible_child_name(target)
-            if self._bottom_bar:
-                self._bottom_bar.set_visible(target == "results")
-            if self._new_prompt_btn:
-                self._new_prompt_btn.set_visible(target == "results")
+            self._set_results_chrome_visible(target == "results")
 
     def update_tracks(
         self,
@@ -427,6 +474,29 @@ class HTAIRadioPage(Page):
         self._history = history
         self.set_title(title)
 
+        if self._title_label:
+            self._title_label.set_label(title)
+        if self._first_subtitle_label:
+            unique_artists: list[str] = []
+            seen: set[str] = set()
+            for t in tracks:
+                name = t.artist.name if t.artist else None
+                if name and name not in seen:
+                    seen.add(name)
+                    unique_artists.append(name)
+            display = unique_artists[:3]
+            artist_text = ", ".join(display)
+            if len(unique_artists) > 3:
+                artist_text += _(" and more")
+            self._first_subtitle_label.set_label(artist_text)
+        if self._second_subtitle_label:
+            total_duration = sum((t.duration or 0) for t in tracks)
+            self._second_subtitle_label.set_label(
+                _("{} tracks ({})").format(
+                    len(tracks), utils.pretty_duration(total_duration)
+                )
+            )
+
         if self._auto_load:
             self._auto_load.set_items(tracks)
             self._auto_load.set_function(None)
@@ -440,10 +510,7 @@ class HTAIRadioPage(Page):
         def _show_results():
             if self._state_stack:
                 self._state_stack.set_visible_child_name("results")
-            if self._bottom_bar:
-                self._bottom_bar.set_visible(True)
-            if self._new_prompt_btn:
-                self._new_prompt_btn.set_visible(True)
+            self._set_results_chrome_visible(True)
 
         GLib.idle_add(_show_results)
 
@@ -476,8 +543,5 @@ class HTAIRadioPage(Page):
         self._initial_state = "prompt"
         if self._state_stack:
             self._state_stack.set_visible_child_name("prompt")
-        if self._bottom_bar:
-            self._bottom_bar.set_visible(False)
-        if self._new_prompt_btn:
-            self._new_prompt_btn.set_visible(False)
+        self._set_results_chrome_visible(False)
         self.emit("new-prompt")

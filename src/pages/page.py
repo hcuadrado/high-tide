@@ -81,7 +81,6 @@ class Page(Adw.NavigationPage, IDisconnectable):
         self.content_stack = self.builder.get_object("_content_stack")
         self.object = self.builder.get_object("_main")
         self.scrolled_window = self.builder.get_object("_scrolled_window")
-        self.header_bar = self.builder.get_object("_header_bar")
 
         self.set_child(self.object)
 
