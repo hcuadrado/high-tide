@@ -107,6 +107,8 @@ def _parse_response(text: str) -> dict:
         raise ValueError("No JSON object in LLM response")
 
     data = json.loads(stripped[start:end])
+    logger.debug("Parsed response: %s", data)
+
     for key in ("title", "search_queries"):
         if key not in data:
             raise ValueError(f"Missing required key: {key}")
@@ -322,6 +324,7 @@ def _get_radio_tracks(seeds: list, cancel_event: threading.Event) -> list:
     # Round-robin merge with per-artist cap so no single seed (or artist) dominates.
     result: list = []
     seen_ids: set = set()
+    seen_isrcs: set = set()
     artist_counts: dict = {}
     cursors = [0] * len(per_seed_pools)
 
@@ -335,6 +338,9 @@ def _get_radio_tracks(seeds: list, cancel_event: threading.Event) -> list:
             progressed = True
             if not hasattr(track, "id") or track.id in seen_ids:
                 continue
+            isrc = getattr(track, "isrc", None)
+            if isrc and isrc in seen_isrcs:
+                continue
             artist_id = (
                 track.artist.id
                 if track.artist and hasattr(track.artist, "id")
@@ -344,6 +350,8 @@ def _get_radio_tracks(seeds: list, cancel_event: threading.Event) -> list:
                 continue
             result.append(track)
             seen_ids.add(track.id)
+            if isrc:
+                seen_isrcs.add(isrc)
             if artist_id is not None:
                 artist_counts[artist_id] = artist_counts.get(artist_id, 0) + 1
             if len(result) >= _TOTAL_LIMIT:
@@ -363,20 +371,26 @@ def _decade_prefilter(tracks: list, quality_criteria: dict) -> list:
     decade_str = quality_criteria.get("decade", "")
     if not decade_str:
         return tracks
-    years = [int(m) for m in re.findall(r"\b((?:19|20)\d{2})\b", decade_str)]
+    years = [int(m) for m in re.findall(r"(?:19|20)\d{2}", decade_str)]
     if not years:
         return tracks
     start_year = (min(years) // 10) * 10
     end_year = (max(years) // 10) * 10 + 9
-    filtered = [
-        t for t in tracks
-        if (
-            t.album
-            and t.album.release_date
-            and start_year <= t.album.release_date.year <= end_year
-        )
-    ]
-    logger.debug("Decade filter %s: %d → %d tracks", decade_str, len(tracks), len(filtered) if filtered else len(tracks))
+
+    def _known_wrong_decade(t) -> bool:
+        if not t.album:
+            return False
+        # available_release_date falls back to tidal_release_date (streamStartDate)
+        # when releaseDate is absent — more tracks have this populated.
+        d = t.album.available_release_date
+        return d is not None and not (start_year <= d.year <= end_year)
+
+    # Exclude tracks with a confirmed out-of-decade date; keep unknowns.
+    filtered = [t for t in tracks if not _known_wrong_decade(t)]
+    logger.debug(
+        "Decade filter %s (%d–%d): removed %d/%d out-of-decade tracks",
+        decade_str, start_year, end_year, len(tracks) - len(filtered), len(tracks),
+    )
     return filtered if filtered else tracks
 
 
@@ -472,6 +486,7 @@ def _critic_filter(
         "Return a JSON array of 0-based indices for tracks scoring 4-5/5 for "
         "relevance. Only the array, nothing else. Example: [0, 2, 5]"
     )
+    logger.debug("Critic message: %s", critic_msg)
 
     try:
         response = _call_provider(
@@ -513,6 +528,8 @@ def generate_radio(
     base_url: str = "",
     use_critic: bool = False,
     corpus_ids: dict | None = None,
+    skipped_ids: set | None = None,
+    banned_ids: dict | None = None,
 ) -> tuple:
     """Return (title, tracks, suggestions, updated_history)."""
     logger.debug("generate_radio prompt=%r provider=%s model=%s history_turns=%d use_critic=%s", prompt, provider, model, len(conversation_history or []), use_critic)
@@ -531,6 +548,7 @@ def generate_radio(
         taste_sample=taste_sample or {},
         playlist_names=playlist_names or [],
     )
+    logger.debug("User message: %s", user_msg)
     messages = history + [{"role": "user", "content": user_msg}]
 
     if cancel_event.is_set():
@@ -589,6 +607,22 @@ def generate_radio(
             base_url,
             cancel_event,
         )
+
+    if skipped_ids:
+        before = len(tracks)
+        tracks = [t for t in tracks if t.id not in skipped_ids]
+        logger.debug("Skipped filter: %d → %d tracks", before, len(tracks))
+
+    if banned_ids:
+        banned_track_ids = banned_ids.get("track_ids", set())
+        banned_artist_ids = banned_ids.get("artist_ids", set())
+        before = len(tracks)
+        tracks = [
+            t for t in tracks
+            if t.id not in banned_track_ids
+            and not (t.artist and hasattr(t.artist, "id") and t.artist.id in banned_artist_ids)
+        ]
+        logger.debug("Ban filter: %d → %d tracks", before, len(tracks))
 
     logger.debug("generate_radio done: title=%r tracks=%d suggestions=%d", title, len(tracks), len(suggestions))
     return title, tracks, suggestions, updated_history

@@ -331,6 +331,7 @@ class HTAIRadioPage(Page):
 
         self._auto_load = HTAutoLoadWidget()
         self._auto_load.set_scrolled_window(self.scrolled_window)
+        self._auto_load.set_row_extra_setup(self._setup_ban_row)
         self.disconnectables.append(self._auto_load)
         box.append(self._auto_load)
 
@@ -373,6 +374,17 @@ class HTAIRadioPage(Page):
     def _on_chip_clicked(self, btn, suggestion: str) -> None:
         self._refine_entry.set_text(suggestion)
         self._on_refine_submit()
+
+    def _setup_ban_row(self, row) -> None:
+        if row.track.artist:
+            row.track_menu.append(
+                _("Ban artist from AI Radio"),
+                f"win.ban-ai-artist::{row.track.artist.id}",
+            )
+        row.track_menu.append(
+            _("Ban track from AI Radio"),
+            f"win.ban-ai-track::{row.track.id}",
+        )
 
     def _on_play_clicked(self, *args) -> None:
         if self._tracks:

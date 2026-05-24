@@ -130,6 +130,14 @@ class HighTideWindow(Adw.ApplicationWindow):
             self.on_push_artist_radio_page,
         )
 
+        self.create_action_with_target(
+            "ban-ai-track", GLib.VariantType.new("s"), self._on_ban_ai_track
+        )
+
+        self.create_action_with_target(
+            "ban-ai-artist", GLib.VariantType.new("s"), self._on_ban_ai_artist
+        )
+
         # self.create_action_with_target(
         #     'play-next',
         #     GLib.VariantType.new("s"),
@@ -205,6 +213,10 @@ class HighTideWindow(Adw.ApplicationWindow):
         self.ai_cancel_event: threading.Event | None = None
         self.ai_radio_page: HTAIRadioPage | None = None
         self.ai_radio_snapshot: dict | None = None
+        self._ai_radio_track_ids: set = set()
+        self._ai_skipped_ids: set = set()
+        self._ai_prev_track = None
+        self._ai_song_start_us: int = 0
 
         self.videoplayer = Gtk.MediaFile.new()
 
@@ -341,12 +353,27 @@ class HighTideWindow(Adw.ApplicationWindow):
     #   UPDATES UI
     #
 
+    def _detect_ai_skip(self) -> None:
+        prev = self._ai_prev_track
+        if prev is not None and prev.id in self._ai_radio_track_ids:
+            elapsed_us = GLib.get_real_time() - self._ai_song_start_us
+            track_dur_us = (prev.duration or 0) * 1_000_000
+            if track_dur_us > 0 and elapsed_us / track_dur_us < 0.4:
+                self._ai_skipped_ids.add(prev.id)
+                logger.debug(
+                    "AI Radio skip: track %s (%.0f%% played)",
+                    prev.id, 100 * elapsed_us / track_dur_us,
+                )
+        self._ai_prev_track = self.player_object.playing_track
+        self._ai_song_start_us = GLib.get_real_time()
+
     def on_song_changed(self, *args):
         """Handle song change events from the player.
 
         Updates the UI elements when the currently playing song changes,
         including album art, track information, and video covers.
         """
+        self._detect_ai_skip()
         logger.info("song changed")
         album = self.player_object.song_album
         track = self.player_object.playing_track
@@ -840,6 +867,9 @@ class HighTideWindow(Adw.ApplicationWindow):
 
     def _on_ai_radio_new_prompt(self, page) -> None:
         self.ai_radio_snapshot = None
+        self._ai_skipped_ids.clear()
+        self._ai_radio_track_ids.clear()
+        self._ai_prev_track = None
         if self.ai_cancel_event:
             self.ai_cancel_event.set()
 
@@ -864,6 +894,18 @@ class HighTideWindow(Adw.ApplicationWindow):
             utils.send_toast(_("Taste data refreshed"), 2)
         taste_corpus.refresh_in_background(self.session, on_done=_done)
 
+    def _ai_radio_call_args(self, prompt, playlist_names, history, cancel_event):
+        provider = self.settings.get_string("ai-provider")
+        model = self.settings.get_string("ai-model")
+        base_url = self.settings.get_string("ai-ollama-url")
+        use_critic = self.settings.get_boolean("ai-use-critic-filter")
+        skipped_ids = frozenset(self._ai_skipped_ids)
+        banned_ids = self._get_banned_ids()
+        return (
+            prompt, playlist_names, history, cancel_event,
+            provider, model, base_url, use_critic, skipped_ids, banned_ids,
+        )
+
     def _on_page_generate_radio(self, page, prompt: str) -> None:
         if self.ai_cancel_event:
             self.ai_cancel_event.set()
@@ -873,21 +915,13 @@ class HighTideWindow(Adw.ApplicationWindow):
         cancel_event = threading.Event()
         self.ai_cancel_event = cancel_event
 
-        provider = self.settings.get_string("ai-provider")
-        model = self.settings.get_string("ai-model")
-        base_url = self.settings.get_string("ai-ollama-url")
-        use_critic = self.settings.get_boolean("ai-use-critic-filter")
-
         playlist_names = [
             p.name for p in utils.user_playlists if hasattr(p, "name")
         ]
 
         threading.Thread(
             target=self._th_generate_radio,
-            args=(
-                gen, prompt, playlist_names,
-                [], cancel_event, provider, model, base_url, use_critic,
-            ),
+            args=(gen, *self._ai_radio_call_args(prompt, playlist_names, [], cancel_event)),
         ).start()
 
     def on_refine_radio(self, page, refinement_prompt: str, current_history: list):
@@ -899,26 +933,21 @@ class HighTideWindow(Adw.ApplicationWindow):
         cancel_event = threading.Event()
         self.ai_cancel_event = cancel_event
 
-        provider = self.settings.get_string("ai-provider")
-        model = self.settings.get_string("ai-model")
-        base_url = self.settings.get_string("ai-ollama-url")
-        use_critic = self.settings.get_boolean("ai-use-critic-filter")
-
         playlist_names = [
             p.name for p in utils.user_playlists if hasattr(p, "name")
         ]
 
         threading.Thread(
             target=self._th_generate_radio,
-            args=(
-                gen, refinement_prompt, playlist_names,
-                current_history, cancel_event, provider, model, base_url, use_critic,
-            ),
+            args=(gen, *self._ai_radio_call_args(
+                refinement_prompt, playlist_names, current_history, cancel_event
+            )),
         ).start()
 
     def _th_generate_radio(
         self, gen, prompt, playlist_names,
         history, cancel_event, provider, model, base_url, use_critic,
+        skipped_ids=None, banned_ids=None,
     ):
         # Read the API key here so the main thread is never blocked by libsecret
         api_key = self.secret_store.read_ai_key(provider) or ""
@@ -941,6 +970,8 @@ class HighTideWindow(Adw.ApplicationWindow):
                 base_url=base_url,
                 use_critic=use_critic,
                 corpus_ids=corpus_ids,
+                skipped_ids=skipped_ids,
+                banned_ids=banned_ids,
             )
             GLib.idle_add(
                 self._on_radio_ready,
@@ -959,6 +990,27 @@ class HighTideWindow(Adw.ApplicationWindow):
             logger.exception("AI Radio generation failed")
             GLib.idle_add(self._on_radio_error, gen, "bad_result", provider)
 
+    def _get_banned_ids(self) -> dict:
+        track_ids = set(self.settings.get_strv("ai-banned-track-ids"))
+        artist_ids = set(self.settings.get_strv("ai-banned-artist-ids"))
+        return {"track_ids": track_ids, "artist_ids": artist_ids}
+
+    def _on_ban_ai_track(self, action, parameter):
+        track_id = parameter.get_string()
+        current = list(self.settings.get_strv("ai-banned-track-ids"))
+        if track_id not in current:
+            current.append(track_id)
+            self.settings.set_strv("ai-banned-track-ids", current)
+            utils.send_toast(_("Track banned from AI Radio"), 2)
+
+    def _on_ban_ai_artist(self, action, parameter):
+        artist_id = parameter.get_string()
+        current = list(self.settings.get_strv("ai-banned-artist-ids"))
+        if artist_id not in current:
+            current.append(artist_id)
+            self.settings.set_strv("ai-banned-artist-ids", current)
+            utils.send_toast(_("Artist banned from AI Radio"), 2)
+
     def _on_radio_ready(self, gen, prompt, title, tracks, suggestions, history):
         if gen != self.ai_generation_id:
             return
@@ -967,6 +1019,7 @@ class HighTideWindow(Adw.ApplicationWindow):
             if self.ai_radio_page:
                 self.ai_radio_page.set_loading(False)
             return
+        self._ai_radio_track_ids = {t.id for t in tracks}
         if self.ai_radio_page:
             self.ai_radio_page.update_tracks(title, tracks, suggestions, history)
 

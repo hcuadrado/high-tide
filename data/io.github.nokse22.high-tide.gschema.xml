@@ -65,5 +65,11 @@
 	  <key name="ai-use-critic-filter" type="b">
       <default>false</default>
     </key>
+	  <key name="ai-banned-track-ids" type="as">
+      <default>[]</default>
+    </key>
+	  <key name="ai-banned-artist-ids" type="as">
+      <default>[]</default>
+    </key>
 	</schema>
 </schemalist>

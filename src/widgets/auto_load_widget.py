@@ -58,6 +58,7 @@ class HTAutoLoadWidget(Gtk.Box, IDisconnectable):
 
         self.handler_id = None
         self.scrolled_window = None
+        self._row_extra_setup = None
 
     def reset(self):
         """Reset the widget so it can be reused with new data"""
@@ -71,6 +72,9 @@ class HTAutoLoadWidget(Gtk.Box, IDisconnectable):
             while child:
                 self.parent.remove(child)
                 child = self.parent.get_first_child()
+
+    def set_row_extra_setup(self, callback) -> None:
+        self._row_extra_setup = callback
 
     def set_function(self, function: callable) -> None:
         """
@@ -173,6 +177,8 @@ class HTAutoLoadWidget(Gtk.Box, IDisconnectable):
             listing = HTGenericTrackWidget(track)
             self.disconnectables.append(listing)
             listing.index = index + self.items_n
+            if self._row_extra_setup:
+                self._row_extra_setup(listing)
             self.parent.append(listing)
 
     def _add_cards(self, new_items):
