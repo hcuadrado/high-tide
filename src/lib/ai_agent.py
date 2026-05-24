@@ -43,11 +43,13 @@ _SYSTEM_PROMPT = (
     "}\n\n"
     "Rules:\n"
     "- Maximum 5 search_queries\n"
-    "- familiar_artist_picks: up to 3 artist names chosen from the user's favourite "
-    "artists that genuinely match the requested vibe. Pick artists from DIFFERENT "
-    "genres/styles to maximize variety — avoid stacking three picks from the same "
-    "genre, since each pick seeds ~30 tracks from its style. These become seeds "
-    "alongside search_queries. Omit or leave empty [] if no favourite artist fits.\n"
+    "- familiar_artist_picks: up to 6 artist names chosen from the user's listening "
+    "history and playlists that genuinely match the requested vibe. Picks are drawn "
+    "from listening history and playlists, not just liked favourites. Pick artists "
+    "from DIFFERENT genres/styles to maximize variety — avoid stacking picks from "
+    "the same genre, since each pick seeds ~30 tracks from its style. These become "
+    "seeds alongside search_queries. Omit or leave empty [] if no familiar artist "
+    "fits.\n"
     "- Maximum 3 playlist_names (use names from user context when strategy is playlist)\n"
     "- Maximum 4 suggestions — phrase as follow-up instructions, not descriptions\n"
     '- quality_criteria.decade: format "1990s" / "2000s", or "" if not applicable\n'
@@ -112,7 +114,7 @@ def _parse_response(text: str) -> dict:
     data["search_queries"] = data.get("search_queries", [])[:5]
     data["familiar_artist_picks"] = [
         p for p in data.get("familiar_artist_picks", []) if isinstance(p, str)
-    ][:3]
+    ][:6]
     data["playlist_names"] = data.get("playlist_names", [])[:3]
     data["suggestions"] = data.get("suggestions", [])[:4]
     logger.debug(
@@ -125,38 +127,23 @@ def _parse_response(text: str) -> dict:
     return data
 
 
-def _build_taste_profile(
-    playlists=None,
-    favourite_artists=None,
-    favourite_tracks=None,
-) -> dict:
-    """Extract user taste data into a structured dict.
-
-    Kept separate from formatting so Phase 2 can cache and reuse this dict
-    without rebuilding it on every generate_radio call.
-    """
+def _build_taste_profile(taste_sample: dict, playlist_names: list) -> dict:
     return {
         "artist_names": [
-            a.name for a in (favourite_artists or [])[:20] if hasattr(a, "name")
+            a["name"] for a in taste_sample.get("artists", []) if "name" in a
         ],
         "track_entries": [
-            f"{t.name} by {t.artist.name}"
-            for t in (favourite_tracks or [])[:30]
-            if hasattr(t, "name") and hasattr(t, "artist") and t.artist
+            f"{t['name']} by {t['artist_name']} ({t['year']})"
+            if t.get("year") else f"{t['name']} by {t['artist_name']}"
+            for t in taste_sample.get("tracks", [])
+            if t.get("name") and t.get("artist_name")
         ],
-        "playlist_names": [
-            p.name for p in (playlists or []) if hasattr(p, "name")
-        ],
+        "playlist_names": list(playlist_names),
     }
 
 
-def _build_user_message(
-    prompt: str,
-    playlists=None,
-    favourite_artists=None,
-    favourite_tracks=None,
-) -> str:
-    profile = _build_taste_profile(playlists, favourite_artists, favourite_tracks)
+def _build_user_message(prompt: str, taste_sample: dict, playlist_names: list) -> str:
+    profile = _build_taste_profile(taste_sample, playlist_names)
     parts = [f"Request: {prompt}"]
     if profile["artist_names"]:
         parts.append(f"Favourite artists: {', '.join(profile['artist_names'])}")
@@ -176,26 +163,26 @@ def _resolve_seeds(
     seeds = []
     seen_ids: set = set()
 
-    # Resolve familiar picks first so they survive the 5-seed cap.
-    fav_by_name = {
-        a.name.lower(): a
-        for a in utils.favourite_artists
-        if hasattr(a, "name") and hasattr(a, "id")
-    }
-    for name in (familiar_artist_picks or [])[:3]:
+    # Resolve familiar picks first so they survive the 8-seed cap.
+    for name in (familiar_artist_picks or [])[:6]:
         if cancel_event.is_set():
             break
-        name_lower = name.lower()
-        match = fav_by_name.get(name_lower) or next(
-            (a for a in utils.favourite_artists if hasattr(a, "name") and name_lower in a.name.lower()),
-            None,
-        )
-        if match is not None and match.id not in seen_ids:
-            logger.debug("Familiar pick %r → artist id=%s", name, match.id)
-            seeds.append(match)
-            seen_ids.add(match.id)
-        else:
-            logger.debug("Familiar pick %r → no match in favourite_artists", name)
+        try:
+            results = utils.session.search(name, [Artist], limit=3)
+            artists = results.get("artists") or []
+            top_hit = results.get("top_hit")
+            match = next(
+                (a for a in artists if hasattr(a, "id")),
+                top_hit if isinstance(top_hit, Artist) else None,
+            )
+            if match is not None and match.id not in seen_ids:
+                logger.debug("Familiar pick %r → artist id=%s", name, match.id)
+                seeds.append(match)
+                seen_ids.add(match.id)
+            else:
+                logger.debug("Familiar pick %r → no search result", name)
+        except Exception:
+            logger.exception("Search failed for familiar pick: %s", name)
 
     for query in search_queries[:5]:
         if cancel_event.is_set():
@@ -205,24 +192,14 @@ def _resolve_seeds(
             seed = None
             top_hit = results.get("top_hit")
             artists = results.get("artists") or []
-            # Prefer Artist seeds — their radio mixes are far more reliable than
-            # track radio, which frequently raises MetadataNotAvailable.
-            if isinstance(top_hit, Track) and artists:
-                candidate = artists[0]
-                if (
-                    top_hit.artist
-                    and hasattr(top_hit.artist, "id")
-                    and hasattr(candidate, "id")
-                    and top_hit.artist.id == candidate.id
-                ):
-                    seed = candidate
-                    logger.debug("Query %r: promoted Artist over Track top_hit", query)
-                else:
-                    seed = top_hit
+            # Always prefer Artist seeds — their radio mixes are far more
+            # reliable than track radio, which frequently 404s.
+            if artists:
+                seed = artists[0]
+                if not isinstance(top_hit, Artist):
+                    logger.debug("Query %r: using Artist seed over Track top_hit", query)
             elif isinstance(top_hit, (Track, Artist)):
                 seed = top_hit
-            elif artists:
-                seed = artists[0]
             elif results.get("tracks"):
                 seed = results["tracks"][0]
 
@@ -257,13 +234,13 @@ def _resolve_seeds(
     if len(seeds) < 3:
         logger.debug("Seed top-up: %d seeds resolved, padding from favourite_artists", len(seeds))
         for artist in utils.favourite_artists:
-            if len(seeds) >= 5:
+            if len(seeds) >= 8:
                 break
             if hasattr(artist, "id") and artist.id not in seen_ids:
                 seeds.append(artist)
                 seen_ids.add(artist.id)
 
-    result = seeds[:5]
+    result = seeds[:8]
     logger.debug(
         "Resolved %d seeds from %d queries + %d playlist names + familiar picks",
         len(result), len(search_queries), len(playlist_names),
@@ -546,9 +523,8 @@ def generate_radio(
     api_key: str,
     model: str,
     cancel_event: threading.Event,
-    playlists=None,
-    favourite_artists=None,
-    favourite_tracks=None,
+    taste_sample: dict | None = None,
+    playlist_names: list | None = None,
     conversation_history=None,
     base_url: str = "",
     use_critic: bool = False,
@@ -567,9 +543,8 @@ def generate_radio(
 
     user_msg = _build_user_message(
         prompt,
-        playlists=playlists,
-        favourite_artists=favourite_artists,
-        favourite_tracks=favourite_tracks,
+        taste_sample=taste_sample or {},
+        playlist_names=playlist_names or [],
     )
     messages = history + [{"role": "user", "content": user_msg}]
 

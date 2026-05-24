@@ -25,6 +25,7 @@ class HTAIRadioPage(Page):
         "refine": (GObject.SignalFlags.RUN_FIRST, None, (str, GObject.TYPE_PYOBJECT)),
         "cancel-generate": (GObject.SignalFlags.RUN_FIRST, None, ()),
         "new-prompt": (GObject.SignalFlags.RUN_FIRST, None, ()),
+        "refresh-taste": (GObject.SignalFlags.RUN_FIRST, None, ()),
     }
 
     def __init__(self) -> None:
@@ -307,6 +308,15 @@ class HTAIRadioPage(Page):
         self.signals.append((self._refine_entry, self._refine_entry.connect(
             "activate", lambda *_: self._on_refine_submit()
         )))
+        refresh_btn = Gtk.Button(
+            icon_name="view-refresh-symbolic",
+            tooltip_text=_("Refresh taste data"),
+            valign=Gtk.Align.CENTER,
+            css_classes=["flat", "circular"],
+        )
+        self.signals.append((refresh_btn, refresh_btn.connect(
+            "clicked", lambda *_: self.emit("refresh-taste")
+        )))
         refine_row = Gtk.Box(
             spacing=6,
             margin_start=12,
@@ -316,6 +326,7 @@ class HTAIRadioPage(Page):
         refine_row.append(self._refine_entry)
         refine_row.append(refine_btn)
         refine_row.append(self._new_prompt_btn)
+        refine_row.append(refresh_btn)
         box.append(refine_row)
 
         self._auto_load = HTAutoLoadWidget()

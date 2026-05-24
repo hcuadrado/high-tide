@@ -25,7 +25,7 @@ import requests
 from gi.repository import Adw, Gio, GLib, GObject, Gst, Gtk, Xdp
 from tidalapi.media import Quality
 
-from .lib import HTCache, PlayerObject, RepeatType, SecretStore, ai_agent, utils
+from .lib import HTCache, PlayerObject, RepeatType, SecretStore, ai_agent, taste_corpus, utils
 from .lib.ai_providers import ProviderAuthError
 from .login import LoginDialog
 from .mpris import MPRIS
@@ -273,6 +273,7 @@ class HighTideWindow(Adw.ApplicationWindow):
             GLib.idle_add(self.on_login_failed)
         else:
             utils.get_favourites()
+            taste_corpus.refresh_in_background(self.session)
             GLib.idle_add(self.on_logged_in)
 
     def logout(self):
@@ -829,6 +830,7 @@ class HighTideWindow(Adw.ApplicationWindow):
         page.connect("refine", self.on_refine_radio)
         page.connect("cancel-generate", self._on_ai_cancel_generate)
         page.connect("new-prompt", self._on_ai_radio_new_prompt)
+        page.connect("refresh-taste", self._on_refresh_taste)
         if self.ai_radio_snapshot:
             page._restore_snapshot = self.ai_radio_snapshot
         self.ai_radio_page = page
@@ -857,6 +859,11 @@ class HighTideWindow(Adw.ApplicationWindow):
         if self.ai_cancel_event:
             self.ai_cancel_event.set()
 
+    def _on_refresh_taste(self, page) -> None:
+        def _done():
+            utils.send_toast(_("Taste data refreshed"), 2)
+        taste_corpus.refresh_in_background(self.session, on_done=_done)
+
     def _on_page_generate_radio(self, page, prompt: str) -> None:
         if self.ai_cancel_event:
             self.ai_cancel_event.set()
@@ -871,14 +878,14 @@ class HighTideWindow(Adw.ApplicationWindow):
         base_url = self.settings.get_string("ai-ollama-url")
         use_critic = self.settings.get_boolean("ai-use-critic-filter")
 
-        playlists = list(utils.user_playlists) + list(utils.favourite_playlists)
-        fav_artists = list(utils.favourite_artists)
-        fav_tracks = list(utils.favourite_tracks)
+        playlist_names = [
+            p.name for p in utils.user_playlists if hasattr(p, "name")
+        ]
 
         threading.Thread(
             target=self._th_generate_radio,
             args=(
-                gen, prompt, playlists, fav_artists, fav_tracks,
+                gen, prompt, playlist_names,
                 [], cancel_event, provider, model, base_url, use_critic,
             ),
         ).start()
@@ -897,34 +904,35 @@ class HighTideWindow(Adw.ApplicationWindow):
         base_url = self.settings.get_string("ai-ollama-url")
         use_critic = self.settings.get_boolean("ai-use-critic-filter")
 
-        playlists = list(utils.user_playlists)
-        fav_artists = list(utils.favourite_artists)
-        fav_tracks = list(utils.favourite_tracks)
+        playlist_names = [
+            p.name for p in utils.user_playlists if hasattr(p, "name")
+        ]
 
         threading.Thread(
             target=self._th_generate_radio,
             args=(
-                gen, refinement_prompt, playlists, fav_artists, fav_tracks,
+                gen, refinement_prompt, playlist_names,
                 current_history, cancel_event, provider, model, base_url, use_critic,
             ),
         ).start()
 
     def _th_generate_radio(
-        self, gen, prompt, playlists, fav_artists, fav_tracks,
+        self, gen, prompt, playlist_names,
         history, cancel_event, provider, model, base_url, use_critic,
     ):
         # Read the API key here so the main thread is never blocked by libsecret
         api_key = self.secret_store.read_ai_key(provider) or ""
         try:
+            corpus = taste_corpus.ensure_corpus(self.session, cancel_event)
+            taste_sample = taste_corpus.sample_for_radio(corpus)
             title, tracks, suggestions, updated_history = ai_agent.generate_radio(
                 prompt=prompt,
                 provider=provider,
                 api_key=api_key,
                 model=model,
                 cancel_event=cancel_event,
-                playlists=playlists,
-                favourite_artists=fav_artists,
-                favourite_tracks=fav_tracks,
+                taste_sample=taste_sample,
+                playlist_names=playlist_names,
                 conversation_history=history,
                 base_url=base_url,
                 use_critic=use_critic,
