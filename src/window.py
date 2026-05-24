@@ -925,6 +925,10 @@ class HighTideWindow(Adw.ApplicationWindow):
         try:
             corpus = taste_corpus.ensure_corpus(self.session, cancel_event)
             taste_sample = taste_corpus.sample_for_radio(corpus)
+            corpus_ids = {
+                "artist_ids": {a["id"] for a in corpus.get("artists", [])},
+                "track_ids": {t["id"] for t in corpus.get("tracks", [])},
+            }
             title, tracks, suggestions, updated_history = ai_agent.generate_radio(
                 prompt=prompt,
                 provider=provider,
@@ -936,6 +940,7 @@ class HighTideWindow(Adw.ApplicationWindow):
                 conversation_history=history,
                 base_url=base_url,
                 use_critic=use_critic,
+                corpus_ids=corpus_ids,
             )
             GLib.idle_add(
                 self._on_radio_ready,

@@ -361,13 +361,13 @@ def _get_radio_tracks(seeds: list, cancel_event: threading.Event) -> list:
 
 def _decade_prefilter(tracks: list, quality_criteria: dict) -> list:
     decade_str = quality_criteria.get("decade", "")
-    if not decade_str or len(decade_str) < 4:
+    if not decade_str:
         return tracks
-    try:
-        start_year = int(decade_str[:4])
-    except ValueError:
+    years = [int(m) for m in re.findall(r"\b((?:19|20)\d{2})\b", decade_str)]
+    if not years:
         return tracks
-    end_year = start_year + 9
+    start_year = (min(years) // 10) * 10
+    end_year = (max(years) // 10) * 10 + 9
     filtered = [
         t for t in tracks
         if (
@@ -380,25 +380,30 @@ def _decade_prefilter(tracks: list, quality_criteria: dict) -> list:
     return filtered if filtered else tracks
 
 
-def _familiar_blend(tracks: list, seeds: list, target_ratio: float = 0.4) -> list:
-    fav_artist_ids = {a.id for a in utils.favourite_artists if hasattr(a, "id")}
-    fav_track_ids = {t.id for t in utils.favourite_tracks if hasattr(t, "id")}
+def _familiar_blend(
+    tracks: list,
+    seeds: list,
+    target_ratio: float = 0.4,
+    corpus_ids: dict | None = None,
+) -> list:
+    corpus_artist_ids = (corpus_ids or {}).get("artist_ids", set())
+    corpus_track_ids = (corpus_ids or {}).get("track_ids", set())
 
     def is_familiar(track) -> bool:
         if not hasattr(track, "id"):
             return False
-        if track.id in fav_track_ids:
+        if track.id in corpus_track_ids:
             return True
-        if track.artist and hasattr(track.artist, "id") and track.artist.id in fav_artist_ids:
+        if track.artist and hasattr(track.artist, "id") and track.artist.id in corpus_artist_ids:
             return True
         for a in getattr(track, "artists", None) or []:
-            if hasattr(a, "id") and a.id in fav_artist_ids:
+            if hasattr(a, "id") and a.id in corpus_artist_ids:
                 return True
         return False
 
     familiar = [t for t in tracks if is_familiar(t)]
     unfamiliar = [t for t in tracks if not is_familiar(t)]
-    cap = min(len(tracks), 60)
+    cap = min(len(tracks), 100)
     target_count = round(cap * target_ratio)
 
     logger.debug(
@@ -406,34 +411,13 @@ def _familiar_blend(tracks: list, seeds: list, target_ratio: float = 0.4) -> lis
         len(familiar), len(unfamiliar), len(tracks), target_count, cap,
     )
 
-    # Supplement familiar bucket from favourites when short.
-    if len(familiar) < target_count:
-        seed_artist_ids: set = set()
-        for s in seeds:
-            if isinstance(s, Artist) and hasattr(s, "id"):
-                seed_artist_ids.add(s.id)
-            elif isinstance(s, Track) and s.artist and hasattr(s.artist, "id"):
-                seed_artist_ids.add(s.artist.id)
-
-        existing_ids = {t.id for t in tracks if hasattr(t, "id")}
-        candidates = [
-            t for t in utils.favourite_tracks
-            if hasattr(t, "id") and t.id not in existing_ids
-            and hasattr(t, "artist") and t.artist
-        ]
-        primary = [t for t in candidates if hasattr(t.artist, "id") and t.artist.id in seed_artist_ids]
-        supplement = primary[:target_count - len(familiar)]
-        if len(familiar) + len(supplement) < target_count:
-            logger.debug(
-                "Familiar supplement short: target=%d got=%d (no off-vibe fill)",
-                target_count, len(familiar) + len(supplement),
-            )
-        familiar.extend(supplement)
-        logger.debug("Supplemented familiar with %d vibe-matched tracks", len(supplement))
-
     # Interleave: distribute familiar at ~target_ratio spacing, preserving bucket order.
     familiar_needed = min(target_count, len(familiar))
     unfamiliar_needed = min(cap - familiar_needed, len(unfamiliar))
+    # Backfill: if unfamiliar ran short, let familiar absorb the slack.
+    if familiar_needed + unfamiliar_needed < cap:
+        extra = cap - familiar_needed - unfamiliar_needed
+        familiar_needed += min(extra, len(familiar) - familiar_needed)
     result: list = []
     fi = ui = 0
     credit = 0.0
@@ -474,7 +458,7 @@ def _critic_filter(
     if cancel_event.is_set() or not tracks:
         return tracks
 
-    capped = tracks[:60]
+    capped = tracks[:100]
     rows = "\n".join(
         f"{i}. {t.name} — "
         f"{getattr(t.artist, 'name', '?') if t.artist else '?'} "
@@ -528,6 +512,7 @@ def generate_radio(
     conversation_history=None,
     base_url: str = "",
     use_critic: bool = False,
+    corpus_ids: dict | None = None,
 ) -> tuple:
     """Return (title, tracks, suggestions, updated_history)."""
     logger.debug("generate_radio prompt=%r provider=%s model=%s history_turns=%d use_critic=%s", prompt, provider, model, len(conversation_history or []), use_critic)
@@ -591,7 +576,7 @@ def generate_radio(
     if quality_criteria:
         tracks = _decade_prefilter(tracks, quality_criteria)
 
-    tracks = _familiar_blend(tracks, seeds)
+    tracks = _familiar_blend(tracks, seeds, corpus_ids=corpus_ids)
 
     if use_critic:
         tracks = _critic_filter(
