@@ -858,12 +858,19 @@ class HighTideWindow(Adw.ApplicationWindow):
         page.connect("cancel-generate", self._on_ai_cancel_generate)
         page.connect("new-prompt", self._on_ai_radio_new_prompt)
         page.connect("refresh-taste", self._on_refresh_taste)
+        page.connect("playlist-saved", self._on_ai_radio_playlist_saved)
         if self.ai_radio_snapshot:
             page._restore_snapshot = self.ai_radio_snapshot
         self.ai_radio_page = page
         page.load()
         self._refresh_ai_radio_state()
         self.navigation_view.push(page)
+
+    def _on_ai_radio_playlist_saved(self, page) -> None:
+        collection_page = self.navigation_view.find_page("collection")
+        if collection_page:
+            self.navigation_view.remove(collection_page)
+        threading.Thread(target=utils.get_favourites, daemon=True).start()
 
     def _on_ai_radio_new_prompt(self, page) -> None:
         self.ai_radio_snapshot = None
