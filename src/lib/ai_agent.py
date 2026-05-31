@@ -328,14 +328,12 @@ def _get_radio_tracks(seeds: list, cancel_event: threading.Event) -> list:
     artist_counts: dict = {}
     cursors = [0] * len(per_seed_pools)
 
-    while len(result) < _TOTAL_LIMIT:
-        progressed = False
+    while any(cursors[i] < len(p) for i, p in enumerate(per_seed_pools)):
         for i, pool in enumerate(per_seed_pools):
             if cursors[i] >= len(pool):
                 continue
             track = pool[cursors[i]]
             cursors[i] += 1
-            progressed = True
             if not hasattr(track, "id") or track.id in seen_ids:
                 continue
             isrc = getattr(track, "isrc", None)
@@ -354,12 +352,8 @@ def _get_radio_tracks(seeds: list, cancel_event: threading.Event) -> list:
                 seen_isrcs.add(isrc)
             if artist_id is not None:
                 artist_counts[artist_id] = artist_counts.get(artist_id, 0) + 1
-            if len(result) >= _TOTAL_LIMIT:
-                break
-        if not progressed:
-            break
 
-    final = result if result else fallback[:_TOTAL_LIMIT]
+    final = result if result else fallback
     logger.debug(
         "Total radio tracks: %d (fallback=%s, distinct artists=%d)",
         len(final), not result, len(artist_counts),
@@ -623,6 +617,8 @@ def generate_radio(
             and not (t.artist and hasattr(t.artist, "id") and t.artist.id in banned_artist_ids)
         ]
         logger.debug("Ban filter: %d → %d tracks", before, len(tracks))
+
+    tracks = tracks[:_TOTAL_LIMIT]
 
     logger.debug("generate_radio done: title=%r tracks=%d suggestions=%d", title, len(tracks), len(suggestions))
     return title, tracks, suggestions, updated_history
