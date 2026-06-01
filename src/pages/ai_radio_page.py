@@ -134,13 +134,27 @@ class HTAIRadioPage(Page):
 
         generate_btn = Gtk.Button(
             label=_("Generate"),
-            halign=Gtk.Align.CENTER,
             css_classes=["pill", "suggested-action"],
             sensitive=False,
         )
         self.signals.append((generate_btn, generate_btn.connect(
             "clicked", self._on_generate_clicked
         )))
+        refresh_btn = Gtk.Button(
+            icon_name="view-refresh-symbolic",
+            tooltip_text=_("Refresh taste data"),
+            valign=Gtk.Align.CENTER,
+            css_classes=["flat", "circular"],
+        )
+        self.signals.append((refresh_btn, refresh_btn.connect(
+            "clicked", lambda *_: self.emit("refresh-taste")
+        )))
+        action_row = Gtk.Box(
+            spacing=6,
+            halign=Gtk.Align.CENTER,
+        )
+        action_row.append(generate_btn)
+        action_row.append(refresh_btn)
         self.signals.append((self._prompt_entry, self._prompt_entry.connect(
             "notify::text",
             lambda *_: generate_btn.set_sensitive(
@@ -158,7 +172,7 @@ class HTAIRadioPage(Page):
         self._prompt_entry.add_controller(key_ctrl)
 
         box.append(prompt_list)
-        box.append(generate_btn)
+        box.append(action_row)
         return box
 
     def _build_loading_view(self) -> Gtk.Widget:
