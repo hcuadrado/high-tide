@@ -233,6 +233,7 @@ class HighTideApplication(Adw.Application):
             self._ai_model_row = builder.get_object("_ai_model_row")
             self._ai_ollama_url_row = builder.get_object("_ai_ollama_url_row")
             ai_critic_row = builder.get_object("_ai_use_critic_row")
+            ai_musicbrainz_row = builder.get_object("_ai_use_musicbrainz_row")
 
             current_provider = self.settings.get_string("ai-provider")
             provider_idx = (
@@ -262,6 +263,12 @@ class HighTideApplication(Adw.Application):
             self.settings.bind(
                 "ai-use-critic-filter",
                 ai_critic_row,
+                "active",
+                Gio.SettingsBindFlags.DEFAULT,
+            )
+            self.settings.bind(
+                "ai-use-musicbrainz",
+                ai_musicbrainz_row,
                 "active",
                 Gio.SettingsBindFlags.DEFAULT,
             )

@@ -65,6 +65,9 @@
 	  <key name="ai-use-critic-filter" type="b">
       <default>false</default>
     </key>
+	  <key name="ai-use-musicbrainz" type="b">
+      <default>true</default>
+    </key>
 	  <key name="ai-banned-track-ids" type="as">
       <default>[]</default>
     </key>

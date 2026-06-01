@@ -91,6 +91,11 @@ Adw.PreferencesDialog _preference_window {
         title: _("Enable quality filter");
         subtitle: _("A second AI pass removes off-topic tracks. Slower (~20s) and doubles API cost.");
       }
+
+      Adw.SwitchRow _ai_use_musicbrainz_row {
+        title: _("Enrich taste with MusicBrainz");
+        subtitle: _("Fetch genre tags from MusicBrainz to improve recommendations. Sends artist names to musicbrainz.org.");
+      }
     }
   }
 }
