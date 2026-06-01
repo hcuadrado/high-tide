@@ -52,6 +52,8 @@ The installed binary is named `high-tide-ai`.
 
 AI Radio generates a personalized TIDAL radio station from a plain-language description. It uses an AI provider of your choice to translate your prompt into search queries, resolves seeds on TIDAL, and builds a radio mix from them.
 
+To personalize results, the app builds a **taste profile** from your listening history (history and daily mixes) and playlists. The profile is cached locally and updated incrementally over time — older listening gradually decays so the profile tracks your current taste rather than calcifying. Optionally, it is enriched with **genre tags from [MusicBrainz](https://musicbrainz.org/)** so the AI can better match prompts that mention a genre, era, or vibe. Enrichment runs in the background, respects MusicBrainz's rate limit, and only ever sends artist names to musicbrainz.org.
+
 ### Supported providers
 
 | Provider | Requires |
@@ -83,6 +85,8 @@ Once the radio loads you can:
 - **Use suggestion chips** that appear below the header for one-click refinements
 - **Save as playlist** to keep the generated tracklist in your TIDAL library
 - **Play / Shuffle** directly from the page header
+- **Refresh taste data** (the refresh icon in the bottom bar) to rebuild your taste profile on demand — also triggers a round of MusicBrainz enrichment
+- **Ban a track or artist** from the track row menu so it never appears in future AI Radio results
 
 ### Preferences reference
 
@@ -93,6 +97,7 @@ Once the radio loads you can:
 | **Model** | Model identifier (e.g. `gpt-4o`, `claude-sonnet-4-6`). Leave blank for the provider default |
 | **Ollama URL** | Base URL of your local Ollama instance. Only used when provider is Ollama |
 | **Use critic filter** | Runs a second AI pass to score and filter the track list for relevance. Doubles API usage; recommended for short or very specific prompts |
+| **Enrich taste with MusicBrainz** | Fetches genre tags from MusicBrainz to sharpen recommendations. Sends artist names to musicbrainz.org; disable to keep taste enrichment fully local |
 
 ## License
 
