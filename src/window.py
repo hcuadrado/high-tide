@@ -968,7 +968,16 @@ class HighTideWindow(Adw.ApplicationWindow):
             corpus = taste_corpus.ensure_corpus(
                 self.session, cancel_event, use_musicbrainz=use_musicbrainz
             )
-            taste_sample = taste_corpus.sample_for_radio(corpus, prompt=prompt)
+            # Let the LLM interpret the prompt into genres so the taste sample
+            # is pre-ranked semantically, not by literal genre-name matching.
+            vocabulary = taste_corpus.genre_vocabulary(corpus)
+            prompt_genres = ai_agent.interpret_prompt_genres(
+                prompt, vocabulary, provider, api_key, model,
+                cancel_event, base_url=base_url,
+            )
+            taste_sample = taste_corpus.sample_for_radio(
+                corpus, prompt=prompt, prompt_genres=prompt_genres
+            )
             corpus_ids = {
                 "artist_ids": {a["id"] for a in corpus.get("artists", [])},
                 "track_ids": {t["id"] for t in corpus.get("tracks", [])},

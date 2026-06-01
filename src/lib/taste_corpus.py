@@ -431,19 +431,33 @@ def _cap_per_artist(tracks: list, max_per_artist: int) -> list:
     return capped
 
 
-def _genre_prerank(items: list, prompt: str, genres_of) -> list:
-    """Float entries whose genres/tags appear in the prompt to the front.
+def genre_vocabulary(corpus: dict, limit: int = 60) -> list:
+    """Return the most common genre/tag strings across the corpus' artists.
 
-    A boost, not a filter: when the prompt names no known genre, order is
-    unchanged. Matched entries land in the sample's top-weight anchor.
+    Used to ground the LLM's prompt→genre interpretation in the genres that
+    actually exist in the user's library.
     """
-    if not prompt:
+    counts: dict = {}
+    for a in corpus.get("artists", []):
+        for g in (a.get("genres") or []) + (a.get("tags") or []):
+            if g:
+                counts[g] = counts.get(g, 0) + 1
+    ranked = sorted(counts, key=lambda g: counts[g], reverse=True)
+    return ranked[:limit]
+
+
+def _genre_prerank(items: list, target_genres: set, genres_of) -> list:
+    """Float entries matching `target_genres` to the front.
+
+    A boost, not a filter: when nothing matches, order is unchanged. Matched
+    entries land in the sample's top-weight anchor.
+    """
+    if not target_genres:
         return items
-    p = prompt.lower()
     matched, rest = [], []
     for it in items:
-        gens = genres_of(it) or []
-        if any(g and g.lower() in p for g in gens):
+        gens = {g.lower() for g in (genres_of(it) or []) if g}
+        if gens & target_genres:
             matched.append(it)
         else:
             rest.append(it)
@@ -456,6 +470,7 @@ def _genre_prerank(items: list, prompt: str, genres_of) -> list:
 def sample_for_radio(
     corpus: dict,
     prompt: str = "",
+    prompt_genres: list | None = None,
     target_artists: int = 80,
     target_tracks: int = 120,
     max_tracks_per_artist: int = 2,
@@ -463,7 +478,9 @@ def sample_for_radio(
     """Return a sampled subset: 70% top-weight anchor + 30% random tail.
 
     Tracks are first capped per-artist (so a heavily-played artist can't flood
-    the list) and both lists are genre-pre-ranked against the prompt.
+    the list), then both lists are genre-pre-ranked. `prompt_genres` (the LLM's
+    semantic interpretation of the prompt) is preferred; if empty, falls back to
+    matching genres that appear literally in `prompt`.
     """
 
     def _sample(items: list, target: int) -> list:
@@ -483,11 +500,20 @@ def sample_for_radio(
         a["id"]: (a.get("genres") or []) + (a.get("tags") or [])
         for a in artists if "id" in a
     }
+
+    if prompt_genres:
+        target = {g.lower() for g in prompt_genres if g}
+    else:
+        # Fallback: genres that appear verbatim in the prompt (legacy behavior).
+        p = prompt.lower()
+        vocab = {g for gens in artist_genres.values() for g in gens if g}
+        target = {g.lower() for g in vocab if g.lower() in p}
+
     artists = _genre_prerank(
-        artists, prompt, lambda a: (a.get("genres") or []) + (a.get("tags") or [])
+        artists, target, lambda a: (a.get("genres") or []) + (a.get("tags") or [])
     )
     tracks = _genre_prerank(
-        tracks, prompt, lambda t: artist_genres.get(t.get("artist_id"), [])
+        tracks, target, lambda t: artist_genres.get(t.get("artist_id"), [])
     )
 
     return {

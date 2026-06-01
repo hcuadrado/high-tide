@@ -94,6 +94,69 @@ def _call_provider(
             raise ValueError(f"Unknown provider: {provider}")
 
 
+_GENRE_INTERPRET_SYSTEM = (
+    "You map a free-text music request to genres. Given a list of genres that "
+    "exist in the user's library and a request, return ONLY a JSON array of the "
+    "genres from that list that best match the request's style, mood, and era. "
+    "Pick 3-10. You may include closely related genres from the list even if not "
+    "named explicitly. Use the genres verbatim from the list. No prose."
+)
+
+
+def interpret_prompt_genres(
+    prompt: str,
+    vocabulary: list,
+    provider: str,
+    api_key: str,
+    model: str,
+    cancel_event: threading.Event,
+    base_url: str = "",
+) -> list:
+    """Ask the LLM which library genres match the prompt (semantic pre-rank).
+
+    Returns a list of genres drawn from `vocabulary`. Returns [] when there is
+    no vocabulary, on cancellation, or on any failure — callers then fall back
+    to literal matching.
+    """
+    if not vocabulary or cancel_event.is_set():
+        return []
+    message = (
+        f"Available genres: {', '.join(vocabulary)}\n\n"
+        f"Request: {prompt}\n\n"
+        "Return the matching genres as a JSON array."
+    )
+    try:
+        raw = _call_provider(
+            [{"role": "user", "content": message}],
+            provider,
+            api_key,
+            model,
+            cancel_event,
+            base_url=base_url,
+            system=_GENRE_INTERPRET_SYSTEM,
+        )
+        start = raw.find("[")
+        end = raw.rfind("]") + 1
+        if start == -1 or end == 0:
+            return []
+        data = json.loads(raw[start:end])
+        if not isinstance(data, list):
+            return []
+        # Ground the result in the actual vocabulary (case-insensitive).
+        vocab_lower = {v.lower(): v for v in vocabulary}
+        result: list = []
+        for g in data:
+            if isinstance(g, str):
+                canonical = vocab_lower.get(g.strip().lower())
+                if canonical and canonical not in result:
+                    result.append(canonical)
+        logger.debug("interpret_prompt_genres: %r -> %s", prompt, result)
+        return result
+    except Exception:
+        logger.exception("Prompt genre interpretation failed")
+        return []
+
+
 def _parse_response(text: str) -> dict:
     stripped = text.strip()
     if stripped.startswith("```"):
