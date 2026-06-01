@@ -6,8 +6,10 @@
 MusicBrainz enforces a hard 1 request/second rate limit and requires a
 descriptive User-Agent, so every call goes through a module-level throttle and
 results are cached to disk indefinitely (genres/tags are effectively stable).
-This client is artist-level only for now; recording-level enrichment (per-track
-genres via ISRC) can be layered on later using the same throttle and cache.
+This client is artist-level only: genre data in MusicBrainz lives at the
+artist/release-group level, and the recording (per-ISRC) lookup neither accepts
+a genres inc nor carries useful track-level tags, so tracks inherit their
+artist's genres instead.
 
 All calls must run on a worker thread — they block on the throttle.
 """
