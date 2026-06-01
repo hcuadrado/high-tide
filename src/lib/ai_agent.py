@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from gettext import gettext as _
 
 from tidalapi.media import Track
@@ -290,6 +291,8 @@ _PER_SEED_LIMIT = 40
 _PER_ARTIST_LIMIT = 4
 _TOTAL_LIMIT = 100
 _CRITIC_BATCH = 50
+# Critic batches are independent LLM calls, scored concurrently up to this many.
+_CRITIC_MAX_WORKERS = 4
 
 
 def _fetch_seed_pool(
@@ -490,6 +493,68 @@ def _familiar_blend(
     return result
 
 
+def _critic_score_batch(
+    batch: list,
+    batch_idx: int,
+    prompt: str,
+    quality_criteria: dict,
+    provider: str,
+    api_key: str,
+    model: str,
+    base_url: str,
+    cancel_event: threading.Event,
+) -> list:
+    """Score one batch via the LLM, returning the kept subset in order.
+
+    Fails open — the whole batch is kept on cancellation, a malformed
+    response, or any error — matching the sequential implementation.
+    """
+    if cancel_event.is_set():
+        return batch
+    rows = "\n".join(
+        f"{i}. {t.name} — "
+        f"{getattr(t.artist, 'name', '?') if t.artist else '?'} "
+        f"({t.album.release_date.year if t.album and t.album.release_date else '?'})"
+        for i, t in enumerate(batch)
+    )
+    critic_msg = (
+        f"Original request: {prompt}\n"
+        f"Quality criteria: {json.dumps(quality_criteria)}\n\n"
+        f"Track list:\n{rows}\n\n"
+        "Return a JSON array of 0-based indices for tracks scoring 4-5/5 for "
+        "relevance. Only the array, nothing else. Example: [0, 2, 5]"
+    )
+    logger.debug("Critic message (batch %d): %s", batch_idx, critic_msg)
+    try:
+        response = _call_provider(
+            [{"role": "user", "content": critic_msg}],
+            provider,
+            api_key,
+            model,
+            cancel_event,
+            base_url=base_url,
+        )
+        text = response.strip()
+        start = text.find("[")
+        end = text.rfind("]") + 1
+        if start == -1 or end == 0:
+            return batch
+        indices = json.loads(text[start:end])
+        if not isinstance(indices, list):
+            return batch
+        valid = sorted(
+            {i for i in indices if isinstance(i, int) and 0 <= i < len(batch)}
+        )
+        logger.debug(
+            "Critic filter batch %d: %d → %d tracks",
+            batch_idx, len(batch), len(valid),
+        )
+        return [batch[i] for i in valid]
+    except Exception:
+        logger.exception("Critic pass failed for batch %d, keeping batch", batch_idx)
+        return batch
+
+
 def _critic_filter(
     prompt: str,
     quality_criteria: dict,
@@ -504,59 +569,31 @@ def _critic_filter(
         return tracks
 
     capped = tracks[:_TOTAL_LIMIT]
-    kept: list = []
+    batches = [
+        capped[i:i + _CRITIC_BATCH] for i in range(0, len(capped), _CRITIC_BATCH)
+    ]
 
-    for batch_start in range(0, len(capped), _CRITIC_BATCH):
-        if cancel_event.is_set():
-            kept.extend(capped[batch_start:])
-            break
-        batch = capped[batch_start:batch_start + _CRITIC_BATCH]
-        rows = "\n".join(
-            f"{i}. {t.name} — "
-            f"{getattr(t.artist, 'name', '?') if t.artist else '?'} "
-            f"({t.album.release_date.year if t.album and t.album.release_date else '?'})"
-            for i, t in enumerate(batch)
+    def _score(args):
+        idx, batch = args
+        return _critic_score_batch(
+            batch, idx, prompt, quality_criteria,
+            provider, api_key, model, base_url, cancel_event,
         )
-        critic_msg = (
-            f"Original request: {prompt}\n"
-            f"Quality criteria: {json.dumps(quality_criteria)}\n\n"
-            f"Track list:\n{rows}\n\n"
-            "Return a JSON array of 0-based indices for tracks scoring 4-5/5 for "
-            "relevance. Only the array, nothing else. Example: [0, 2, 5]"
-        )
-        logger.debug("Critic message (batch %d): %s", batch_start, critic_msg)
-        try:
-            response = _call_provider(
-                [{"role": "user", "content": critic_msg}],
-                provider,
-                api_key,
-                model,
-                cancel_event,
-                base_url=base_url,
-            )
-            text = response.strip()
-            start = text.find("[")
-            end = text.rfind("]") + 1
-            if start == -1 or end == 0:
-                kept.extend(batch)
-                continue
-            indices = json.loads(text[start:end])
-            if not isinstance(indices, list):
-                kept.extend(batch)
-                continue
-            valid = sorted(
-                {i for i in indices if isinstance(i, int) and 0 <= i < len(batch)}
-            )
-            kept.extend(batch[i] for i in valid)
-            logger.debug(
-                "Critic filter batch %d: %d → %d tracks",
-                batch_start, len(batch), len(valid),
-            )
-        except Exception:
-            logger.exception("Critic pass failed for batch %d, keeping batch", batch_start)
-            kept.extend(batch)
 
-    logger.debug("Critic filter total: %d → %d tracks", len(capped), len(kept) if kept else len(tracks))
+    if len(batches) <= 1:
+        results = [_score((0, batches[0]))] if batches else []
+    else:
+        # Batches are independent LLM calls — score them concurrently. map()
+        # preserves input order, so the kept tracks stay in their original order.
+        workers = min(len(batches), _CRITIC_MAX_WORKERS)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            results = list(executor.map(_score, enumerate(batches)))
+
+    kept = [t for batch_result in results for t in batch_result]
+    logger.debug(
+        "Critic filter total: %d → %d tracks (%d batches)",
+        len(capped), len(kept) if kept else len(tracks), len(batches),
+    )
     return kept if kept else tracks
 
 
