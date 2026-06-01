@@ -899,7 +899,12 @@ class HighTideWindow(Adw.ApplicationWindow):
     def _on_refresh_taste(self, page) -> None:
         def _done():
             utils.send_toast(_("Taste data refreshed"), 2)
-        taste_corpus.refresh_in_background(self.session, on_done=_done)
+        use_musicbrainz = self.settings.get_boolean("ai-use-musicbrainz")
+        logger.info("AI Radio: manual taste-data refresh requested")
+        # force=True: an explicit refresh rebuilds even if the cache is fresh.
+        taste_corpus.refresh_in_background(
+            self.session, on_done=_done, use_musicbrainz=use_musicbrainz, force=True
+        )
 
     def _ai_radio_call_args(self, prompt, playlist_names, history, cancel_event):
         provider = self.settings.get_string("ai-provider")
@@ -959,8 +964,11 @@ class HighTideWindow(Adw.ApplicationWindow):
         # Read the API key here so the main thread is never blocked by libsecret
         api_key = self.secret_store.read_ai_key(provider) or ""
         try:
-            corpus = taste_corpus.ensure_corpus(self.session, cancel_event)
-            taste_sample = taste_corpus.sample_for_radio(corpus)
+            use_musicbrainz = self.settings.get_boolean("ai-use-musicbrainz")
+            corpus = taste_corpus.ensure_corpus(
+                self.session, cancel_event, use_musicbrainz=use_musicbrainz
+            )
+            taste_sample = taste_corpus.sample_for_radio(corpus, prompt=prompt)
             corpus_ids = {
                 "artist_ids": {a["id"] for a in corpus.get("artists", [])},
                 "track_ids": {t["id"] for t in corpus.get("tracks", [])},

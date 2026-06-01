@@ -129,16 +129,50 @@ def _parse_response(text: str) -> dict:
     return data
 
 
+def _popularity_tier(pop) -> str | None:
+    if not isinstance(pop, (int, float)):
+        return None
+    if pop >= 70:
+        return "hit"
+    if pop >= 40:
+        return "known"
+    return "deep cut"
+
+
+def _artist_entry(artist: dict) -> str | None:
+    name = artist.get("name")
+    if not name:
+        return None
+    genres = (artist.get("genres") or [])[:3]
+    return f"{name} [{', '.join(genres)}]" if genres else name
+
+
+def _track_entry(track: dict) -> str | None:
+    name = track.get("name")
+    artist = track.get("artist_name")
+    if not name or not artist:
+        return None
+    extras = []
+    if track.get("year"):
+        extras.append(str(track["year"]))
+    if track.get("bpm"):
+        extras.append(f"{track['bpm']}bpm")
+    tier = _popularity_tier(track.get("popularity"))
+    if tier:
+        extras.append(tier)
+    suffix = f" ({', '.join(extras)})" if extras else ""
+    return f"{name} by {artist}{suffix}"
+
+
 def _build_taste_profile(taste_sample: dict, playlist_names: list) -> dict:
     return {
-        "artist_names": [
-            a["name"] for a in taste_sample.get("artists", []) if "name" in a
+        "artist_entries": [
+            e for a in taste_sample.get("artists", [])
+            if (e := _artist_entry(a))
         ],
         "track_entries": [
-            f"{t['name']} by {t['artist_name']} ({t['year']})"
-            if t.get("year") else f"{t['name']} by {t['artist_name']}"
-            for t in taste_sample.get("tracks", [])
-            if t.get("name") and t.get("artist_name")
+            e for t in taste_sample.get("tracks", [])
+            if (e := _track_entry(t))
         ],
         "playlist_names": list(playlist_names),
     }
@@ -147,10 +181,12 @@ def _build_taste_profile(taste_sample: dict, playlist_names: list) -> dict:
 def _build_user_message(prompt: str, taste_sample: dict, playlist_names: list) -> str:
     profile = _build_taste_profile(taste_sample, playlist_names)
     parts = [f"Request: {prompt}"]
-    if profile["artist_names"]:
-        parts.append(f"Favourite artists: {', '.join(profile['artist_names'])}")
+    if profile["artist_entries"]:
+        # Artist entries carry [genres] when known — use them to match the vibe.
+        parts.append(f"Favourite artists: {', '.join(profile['artist_entries'])}")
     if profile["track_entries"]:
-        parts.append(f"Favourite tracks: {', '.join(profile['track_entries'])}")
+        # "; " separates tracks since each entry contains its own commas.
+        parts.append(f"Favourite tracks: {'; '.join(profile['track_entries'])}")
     if profile["playlist_names"]:
         parts.append(f"User playlists: {', '.join(profile['playlist_names'])}")
     return "\n\n".join(parts)
