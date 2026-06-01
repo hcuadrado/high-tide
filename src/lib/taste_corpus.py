@@ -17,11 +17,13 @@ from . import utils
 
 logger = logging.getLogger(__name__)
 
-_CACHE_VERSION = 1
+_CACHE_VERSION = 2
 _TTL_SECONDS = 24 * 3600
 _WEIGHT_CAP_MULTIPLIER = 3
-_MAX_ARTISTS = 300
-_MAX_TRACKS = 600
+# Half-life (in days) for time-based decay of carried-over weights. Decay is
+# applied globally on each rebuild based on elapsed wall-clock time, so it is
+# independent of how often _build() actually runs.
+_HALF_LIFE_DAYS = 45.0
 
 _MIX_TYPE_WEIGHT = {
     MixType.history_monthly: 3,
@@ -50,6 +52,8 @@ def _read_cache_if_fresh() -> dict | None:
     try:
         with open(_cache_path()) as f:
             data = json.load(f)
+        if data.get("version") != _CACHE_VERSION:
+            return None
         age = time.time() - data.get("generated_at", 0)
         user_id = getattr(getattr(utils.session, "user", None), "id", None)
         if age < _TTL_SECONDS and (user_id is None or data.get("user_id") == user_id):
@@ -57,6 +61,71 @@ def _read_cache_if_fresh() -> dict | None:
     except (OSError, json.JSONDecodeError, KeyError):
         pass
     return None
+
+
+def _read_existing() -> dict | None:
+    """Read the persisted corpus regardless of TTL, for incremental merge.
+
+    Returns None if missing, unreadable, owned by a different user, or written
+    by an older schema version (older corpora are discarded, not migrated).
+    """
+    try:
+        with open(_cache_path()) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if data.get("version") != _CACHE_VERSION:
+        return None
+    user_id = getattr(getattr(utils.session, "user", None), "id", None)
+    if user_id is not None and data.get("user_id") != user_id:
+        return None
+    return data
+
+
+def _decay_factor(generated_at: float, now: float) -> float:
+    """Exponential decay factor for the time elapsed since the last build."""
+    elapsed_days = max(0.0, (now - generated_at) / 86400.0)
+    return 0.5 ** (elapsed_days / _HALF_LIFE_DAYS)
+
+
+def _merge_entries(
+    existing: list,
+    fresh: dict,
+    now: int,
+    factor: float,
+    preserve_keys: tuple,
+) -> dict:
+    """Merge freshly-accumulated entries onto time-decayed existing ones.
+
+    Existing weights are scaled by `factor`; this run's contributions are added
+    on top (an exponential moving average). Nothing is pruned or capped — old
+    entries simply decay toward (but never reach) zero and sink in the ranking.
+    `preserve_keys` are carried over from the existing entry when it is re-seen
+    this run (e.g. MusicBrainz genres/tags that the fresh fetch doesn't carry).
+    """
+    merged: dict = {}
+    for entry in existing:
+        eid = entry.get("id")
+        if eid is None:
+            continue
+        decayed = round(entry.get("weight", 0) * factor, 4)
+        merged[eid] = {**entry, "weight": decayed}
+        merged[eid].setdefault("first_seen", now)
+
+    for fid, fresh_entry in fresh.items():
+        old = merged.get(fid)
+        if old is not None:
+            carried = {k: old[k] for k in preserve_keys if k in old}
+            merged[fid] = {
+                **fresh_entry,
+                **carried,
+                "weight": round(old["weight"] + fresh_entry["weight"], 4),
+                "first_seen": old.get("first_seen", now),
+                "last_seen": now,
+            }
+        else:
+            merged[fid] = {**fresh_entry, "first_seen": now, "last_seen": now}
+    return merged
 
 
 def _accumulate(artists: dict, tracks: dict, item: Track, weight: int) -> None:
@@ -159,12 +228,37 @@ def _build(session, cancel_event=None) -> dict:
                 getattr(playlist, "name", "?"),
             )
 
+    now = int(time.time())
+    existing = _read_existing()
+    if existing:
+        factor = _decay_factor(existing.get("generated_at", now), now)
+        logger.debug(
+            "taste_corpus: merging onto existing corpus (decay factor %.4f)", factor
+        )
+        merged_artists = _merge_entries(
+            existing.get("artists", []), artists, now, factor,
+            preserve_keys=("genres", "tags", "mbid"),
+        )
+        merged_tracks = _merge_entries(
+            existing.get("tracks", []), tracks, now, factor, preserve_keys=(),
+        )
+    else:
+        merged_artists = {
+            aid: {**a, "first_seen": now, "last_seen": now}
+            for aid, a in artists.items()
+        }
+        merged_tracks = {
+            tid: {**t, "first_seen": now, "last_seen": now}
+            for tid, t in tracks.items()
+        }
+
+    # No pruning or size cap — weights decay over time but entries persist.
     sorted_artists = sorted(
-        artists.values(), key=lambda x: x["weight"], reverse=True
-    )[:_MAX_ARTISTS]
+        merged_artists.values(), key=lambda x: x["weight"], reverse=True
+    )
     sorted_tracks = sorted(
-        tracks.values(), key=lambda x: x["weight"], reverse=True
-    )[:_MAX_TRACKS]
+        merged_tracks.values(), key=lambda x: x["weight"], reverse=True
+    )
 
     if not sorted_artists and not sorted_tracks:
         logger.warning(
@@ -174,7 +268,7 @@ def _build(session, cancel_event=None) -> dict:
     user_id = getattr(getattr(session, "user", None), "id", None)
     corpus = {
         "version": _CACHE_VERSION,
-        "generated_at": int(time.time()),
+        "generated_at": now,
         "user_id": user_id,
         "artists": sorted_artists,
         "tracks": sorted_tracks,
