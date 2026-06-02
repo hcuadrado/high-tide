@@ -12,6 +12,7 @@ from gettext import gettext as _
 
 from tidalapi.media import Track
 from tidalapi.artist import Artist
+from tidalapi.album import Album
 from tidalapi.playlist import Playlist
 from tidalapi.exceptions import MetadataNotAvailable, ObjectNotFound
 
@@ -50,7 +51,9 @@ _SYSTEM_PROMPT = (
     "styles, so a genre-specific title would misrepresent it. Exception: when the "
     "user's prompt explicitly asks for a specific genre or era, the station is more "
     "uniform, so a genre/era title is appropriate.\n"
-    "- Maximum 5 search_queries\n"
+    "- Maximum 5 search_queries; each MUST be exactly two words (e.g. "
+    '"melancholic indie", "90s grunge", "summer reggaeton") — two-word queries '
+    "return far more results than longer ones.\n"
     "- familiar_artist_picks: up to 11 artist names chosen from the user's listening "
     "history and playlists that genuinely match the requested vibe. Picks are drawn "
     "from listening history and playlists, not just liked favourites. Pick artists "
@@ -692,6 +695,105 @@ def _first_working_pool(
     return None, None
 
 
+def _collection_tracks(item, cancel_event: threading.Event) -> list:
+    """All tracks of an album or playlist, shuffled; [] on failure/cancel."""
+    if cancel_event.is_set():
+        return []
+    try:
+        tracks = list(item.tracks())
+    except Exception:
+        logger.exception(
+            "Failed to fetch tracks for %s id=%s",
+            type(item).__name__, getattr(item, "id", "?"),
+        )
+        return []
+    random.shuffle(tracks)
+    return tracks
+
+
+def _playlist_tracks(playlist, cancel_event: threading.Event) -> list:
+    """Up to _PER_SEED_LIMIT shuffled tracks from a playlist, or [] on failure."""
+    return _collection_tracks(playlist, cancel_event)[:_PER_SEED_LIMIT]
+
+
+def _candidates_of(results: dict, kind: str, cls) -> list:
+    """Ordered, deduped hits of one kind from a search result (top_hit first)."""
+    items: list = []
+    seen: set = set()
+    top_hit = results.get("top_hit")
+    if isinstance(top_hit, cls):
+        items.append(top_hit)
+        seen.add(top_hit.id)
+    for it in results.get(kind) or []:
+        if hasattr(it, "id") and it.id not in seen:
+            items.append(it)
+            seen.add(it.id)
+    return items
+
+
+def _playlist_candidates(results: dict) -> list:
+    return _candidates_of(results, "playlists", Playlist)
+
+
+def _album_candidates(results: dict) -> list:
+    return _candidates_of(results, "albums", Album)
+
+
+def _gate_collection_tracks(
+    tracks: list,
+    base_trusted_ids: set,
+    prompt_genres: list,
+    use_musicbrainz: bool,
+    cancel_event: threading.Event,
+    mb_budget: list,
+) -> list:
+    """Drop off-vibe tracks from an album/playlist seed.
+
+    A track is kept when its artist is trusted: present in `base_trusted_ids`
+    (corpus genre-trusted artists + the query's own artist hits) or genre-matched
+    to `prompt_genres` via MusicBrainz. The MB lookup is cache-first and persisted,
+    so the local genre DB grows for unfamiliar album/playlist artists and the gate
+    sharpens over time. With no `prompt_genres` there is no vibe signal to gate on,
+    so the tracks pass through unchanged.
+    """
+    if not prompt_genres:
+        return list(tracks)
+    trusted = set(base_trusted_ids)
+    trusted |= _mb_trusted_artist_ids(
+        tracks, trusted, prompt_genres, use_musicbrainz, cancel_event, mb_budget
+    )
+    return [t for t in tracks if _track_artist_ids(t) & trusted]
+
+
+def _first_gated_collection_pool(
+    items: list,
+    base_trusted_ids: set,
+    prompt_genres: list,
+    use_musicbrainz: bool,
+    cancel_event: threading.Event,
+    mb_budget: list,
+    used_seed_ids: set,
+) -> list:
+    """First album/playlist whose gated tracks are non-empty (shuffled, capped).
+
+    Skips already-used seeds. Off-vibe tracks are dropped first, then the pool is
+    capped — so a seed that gates to nothing is skipped for the next candidate.
+    """
+    for item in items:
+        if cancel_event.is_set():
+            break
+        if getattr(item, "id", None) in used_seed_ids:
+            continue
+        gated = _gate_collection_tracks(
+            _collection_tracks(item, cancel_event), base_trusted_ids,
+            prompt_genres, use_musicbrainz, cancel_event, mb_budget,
+        )[:_PER_SEED_LIMIT]
+        if gated:
+            used_seed_ids.add(item.id)
+            return gated
+    return []
+
+
 def _collect_query_radios(
     queries: list,
     cancel_event: threading.Event,
@@ -705,12 +807,15 @@ def _collect_query_radios(
     Each query contributes a single working radio: the preferred kind alternates
     per query (so coverage splits between track and artist radios), and within a
     query a 404 mix falls back to the next candidate, then to the other kind.
-    Capped at `_MAX_QUERY_RADIOS` total to keep the station tight. Favourite
-    artists are a last resort if no query yields a radio. Tracks by any artist in
-    `exclude_artist_ids` (the 3b artists) are dropped so 3c contributes only
-    different artists. `genre_trusted_artist_ids` are corpus artists whose genres
-    match the prompt — tracks by them may seed a radio even without query-artist
-    corroboration.
+    Capped at `_MAX_QUERY_RADIOS` total to keep the station tight. When a query's
+    track/artist candidates yield no working radio, an album (then a playlist) from
+    the same search is used as the seed instead — its tracks gated to the requested
+    vibe (see _gate_collection_tracks), shuffled and capped.
+    Favourite artists are a last resort if no query yields a radio. Tracks by any
+    artist in `exclude_artist_ids` (the 3b artists) are dropped so 3c contributes
+    only different artists. `genre_trusted_artist_ids` are corpus artists whose
+    genres match the prompt — tracks by them may seed a radio even without
+    query-artist corroboration.
     """
     fallback: list = []
     fetched_artist_ids: set = set()
@@ -723,7 +828,9 @@ def _collect_query_radios(
         if cancel_event.is_set() or len(per_seed_pools) >= _MAX_QUERY_RADIOS:
             break
         try:
-            results = utils.session.search(query, [Track, Artist], limit=5)
+            results = utils.session.search(
+                query, [Track, Artist, Album, Playlist], limit=5
+            )
             logger.info("Search results for query: %s", query)
             logger.info("Search results: %s", results)
         except Exception:
@@ -750,7 +857,30 @@ def _collect_query_radios(
                 )
                 break
         else:
-            logger.debug("Query %r → no working radio", query)
+            # No track/artist radio for this query — seed from an album, then a
+            # playlist, gating their tracks to the vibe so off-vibe results don't
+            # drift the station. The query's own artist hits count as trusted.
+            base_trusted = set(genre_trusted_artist_ids) | {
+                a.id for a in artists_c if hasattr(a, "id")
+            }
+            seed_kind = "album"
+            pool = _first_gated_collection_pool(
+                _album_candidates(results), base_trusted, prompt_genres,
+                use_musicbrainz, cancel_event, mb_budget, used_seed_ids,
+            )
+            if not pool:
+                seed_kind = "playlist"
+                pool = _first_gated_collection_pool(
+                    _playlist_candidates(results), base_trusted, prompt_genres,
+                    use_musicbrainz, cancel_event, mb_budget, used_seed_ids,
+                )
+            if pool:
+                per_seed_pools.append(pool)
+                logger.info(
+                    "3c seed: query %r → %s (%d tracks)", query, seed_kind, len(pool)
+                )
+            else:
+                logger.debug("Query %r → no working radio", query)
 
     # Last resort: favourite artists, only if no query produced a radio.
     if not per_seed_pools:
@@ -825,15 +955,9 @@ def _collect_playlist_tracks(playlist_names: list, cancel_event: threading.Event
             logger.debug("Playlist pick %r → no/duplicate playlist", name)
             continue
         seen_playlist_ids.add(playlist.id)
-        try:
-            tracks = list(playlist.tracks())
-        except Exception:
-            logger.exception("Failed to fetch tracks for playlist: %s", name)
-            continue
-        random.shuffle(tracks)
-        sample = tracks[:_PER_SEED_LIMIT]
+        sample = _playlist_tracks(playlist, cancel_event)
         collected.extend(sample)
-        logger.info("3d playlist %r → %d/%d tracks", name, len(sample), len(tracks))
+        logger.info("3d playlist %r → %d tracks", name, len(sample))
     logger.debug("3d playlists: %d tracks from %d names", len(collected), len(names))
     return collected
 
