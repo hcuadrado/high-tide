@@ -997,6 +997,8 @@ class HighTideWindow(Adw.ApplicationWindow):
                 skipped_ids=skipped_ids,
                 banned_ids=banned_ids,
                 genre_trusted_artist_ids=genre_trusted,
+                prompt_genres=prompt_genres,
+                use_musicbrainz=use_musicbrainz,
             )
             GLib.idle_add(
                 self._on_radio_ready,
@@ -1027,6 +1029,15 @@ class HighTideWindow(Adw.ApplicationWindow):
             current.append(track_id)
             self.settings.set_strv("ai-banned-track-ids", current)
             utils.send_toast(_("Track banned from AI Radio"), 2)
+        # The id set holds the tracks' native ids (ints); the action target is a
+        # string. Discard both forms so the banned track stops counting as on-air.
+        self._ai_radio_track_ids.discard(track_id)
+        try:
+            self._ai_radio_track_ids.discard(int(track_id))
+        except (TypeError, ValueError):
+            pass
+        if self.ai_radio_page:
+            self.ai_radio_page.remove_banned(track_id=track_id)
 
     def _on_ban_ai_artist(self, action, parameter):
         artist_id = parameter.get_string()
@@ -1035,6 +1046,8 @@ class HighTideWindow(Adw.ApplicationWindow):
             current.append(artist_id)
             self.settings.set_strv("ai-banned-artist-ids", current)
             utils.send_toast(_("Artist banned from AI Radio"), 2)
+        if self.ai_radio_page:
+            self.ai_radio_page.remove_banned(artist_id=artist_id)
 
     def _on_radio_ready(self, gen, prompt, title, tracks, suggestions, history):
         if gen != self.ai_generation_id:

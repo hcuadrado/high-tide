@@ -12,9 +12,10 @@ from gettext import gettext as _
 
 from tidalapi.media import Track
 from tidalapi.artist import Artist
+from tidalapi.playlist import Playlist
 from tidalapi.exceptions import MetadataNotAvailable, ObjectNotFound
 
-from . import artist_tracks, utils
+from . import artist_tracks, musicbrainz, utils
 from .ai_providers import (
     call_anthropic,
     call_gemini,
@@ -31,7 +32,7 @@ _SYSTEM_PROMPT = (
     "a personalized radio station.\n\n"
     "Respond with JSON only — no markdown fences, no prose:\n\n"
     "{\n"
-    '  "title": "Human-readable radio title",\n'
+    '  "title": "Evocative vibe/mood name (no genre names)",\n'
     '  "strategy": "search",\n'
     '  "search_queries": ["query1", "query2"],\n'
     '  "familiar_artist_picks": ["Artist Name"],\n'
@@ -44,17 +45,24 @@ _SYSTEM_PROMPT = (
     "  }\n"
     "}\n\n"
     "Rules:\n"
+    "- title: a short, evocative station name describing the vibe, mood, or "
+    "occasion. Do NOT name genres or eras in the title — the station spans several "
+    "styles, so a genre-specific title would misrepresent it. Exception: when the "
+    "user's prompt explicitly asks for a specific genre or era, the station is more "
+    "uniform, so a genre/era title is appropriate.\n"
     "- Maximum 5 search_queries\n"
-    "- familiar_artist_picks: up to 6 artist names chosen from the user's listening "
+    "- familiar_artist_picks: up to 11 artist names chosen from the user's listening "
     "history and playlists that genuinely match the requested vibe. Picks are drawn "
     "from listening history and playlists, not just liked favourites. Pick artists "
     "from DIFFERENT genres/styles to maximize variety — avoid stacking picks from "
     "the same genre, since each pick seeds several of that artist's tracks. Omit or "
     "leave empty [] if no familiar artist fits.\n"
-    "- familiar_track_picks: up to 8 specific songs from the user's listening history "
+    "- familiar_track_picks: up to 11 specific songs from the user's listening history "
     'or playlists that fit the vibe. Format each as "Song Title by Artist Name" so it '
-    "can be looked up. These tracks are added to the station directly. Omit or leave "
-    "empty [] if none fit.\n"
+    "can be looked up. Pick the most representative songs for the vibe regardless of "
+    "artist — repeating an artist is fine. When possible, prefer songs by artists "
+    "OTHER than those in familiar_artist_picks to widen coverage (optional). These "
+    "tracks are added to the station directly. Omit or leave empty [] if none fit.\n"
     "- Maximum 3 playlist_names (use names from user context when strategy is playlist)\n"
     "- Maximum 4 suggestions — phrase as follow-up instructions, not descriptions\n"
     '- quality_criteria.decade: format "1990s" / "2000s", or "" if not applicable\n'
@@ -395,7 +403,7 @@ def _resolve_familiar_artist_tracks(
     return tracks, artist_ids
 
 
-_PER_SEED_LIMIT = 25
+_PER_SEED_LIMIT = 40
 _PER_ARTIST_LIMIT = 5
 _TOTAL_LIMIT = 100
 _CRITIC_BATCH = 50
@@ -406,7 +414,11 @@ _FAMILIAR_TRACK_PICKS_MAX = 11
 # 3c collects at most one radio mix per query, capped at this many total. Kept
 # tight on purpose: the search queries are already diverse, so a few radios cover
 # the vibe without diluting it.
-_MAX_QUERY_RADIOS = 5
+_MAX_QUERY_RADIOS = 3
+# Ad-hoc MusicBrainz rescue (see _mb_trusted_artist_ids): cache-first, with at most
+# this many fresh network lookups per generation. MusicBrainz throttles to 1 req/sec,
+# so the budget bounds added latency on a cold cache; warm runs spend none.
+_QUERY_MB_BUDGET = 10
 
 
 def _fetch_seed_pool(
@@ -419,6 +431,7 @@ def _fetch_seed_pool(
     if cancel_event.is_set() or not isinstance(seed, (Track, Artist)):
         return []
     try:
+        logger.info("Fetching radio mix for seed: %s", seed.name)
         mix = seed.get_radio_mix()
         tracks = list(mix.items())[:_PER_SEED_LIMIT]
         artist_id = seed.id if isinstance(seed, Artist) else (
@@ -428,14 +441,15 @@ def _fetch_seed_pool(
             fetched_artist_ids.add(artist_id)
         return tracks
     except (MetadataNotAvailable, ObjectNotFound):
-        logger.debug("Radio mix not available for seed %s", seed.id)
+        logger.debug("Radio mix not available for seed %s", seed.name)
     except Exception:
-        logger.warning("get_radio_mix failed for seed %s", seed.id, exc_info=True)
+        logger.warning("get_radio_mix failed for seed %s", seed.name, exc_info=True)
 
     if isinstance(seed, Track) and seed.artist:
         artist_id = seed.artist.id if hasattr(seed.artist, "id") else None
         if artist_id and artist_id not in fetched_artist_ids:
             try:
+                logger.info("Fetching artist %s radio mix for track seed: %s", seed.artist.name, seed.name)
                 mix = seed.artist.get_radio_mix()
                 tracks = list(mix.items())[:_PER_SEED_LIMIT]
                 fetched_artist_ids.add(artist_id)
@@ -447,6 +461,7 @@ def _fetch_seed_pool(
                 logger.warning("Artist radio fallback failed for seed %s", seed.id, exc_info=True)
         # Final fallback: artist top tracks (more reliable than track radio)
         try:
+            logger.info("Fetching artist %s top tracks for track seed: %s", seed.artist.name, seed.name)
             top = list(seed.artist.get_top_tracks())[:20]
             logger.debug("Artist top_tracks fallback for track seed %s: %d tracks", seed.id, len(top))
             return top
@@ -455,6 +470,7 @@ def _fetch_seed_pool(
         fallback.append(seed)
     elif isinstance(seed, Artist):
         try:
+            logger.info("Fetching artist %s top tracks for artist seed: %s", seed.name, seed.name)
             top = list(seed.get_top_tracks())[:20]
             logger.debug("Artist top_tracks fallback for seed %s: %d tracks", seed.id, len(top))
             return top
@@ -464,14 +480,15 @@ def _fetch_seed_pool(
 
 
 def _round_robin_merge(per_seed_pools: list) -> list:
-    """Interleave per-seed track pools with id/ISRC dedup and per-artist cap.
+    """Interleave per-seed track pools with id/ISRC dedup.
 
-    Round-robin so no single seed (or artist) dominates the result.
+    Round-robin so no single seed dominates the result. The per-artist cap is
+    applied later, just before the final cut, so it spans every pool source
+    (3b/3c/3d) rather than only these query radios.
     """
     result: list = []
     seen_ids: set = set()
     seen_isrcs: set = set()
-    artist_counts: dict = {}
     cursors = [0] * len(per_seed_pools)
 
     while any(cursors[i] < len(p) for i, p in enumerate(per_seed_pools)):
@@ -485,24 +502,30 @@ def _round_robin_merge(per_seed_pools: list) -> list:
             isrc = getattr(track, "isrc", None)
             if isrc and isrc in seen_isrcs:
                 continue
-            artist_id = (
-                track.artist.id
-                if track.artist and hasattr(track.artist, "id")
-                else None
-            )
-            if artist_id is not None and artist_counts.get(artist_id, 0) >= _PER_ARTIST_LIMIT:
-                continue
             result.append(track)
             seen_ids.add(track.id)
             if isrc:
                 seen_isrcs.add(isrc)
-            if artist_id is not None:
-                artist_counts[artist_id] = artist_counts.get(artist_id, 0) + 1
 
     logger.debug(
-        "Round-robin merge: %d tracks from %d pools (distinct artists=%d)",
-        len(result), len(per_seed_pools), len(artist_counts),
+        "Round-robin merge: %d tracks from %d pools",
+        len(result), len(per_seed_pools),
     )
+    return result
+
+
+def _cap_per_artist(tracks: list, limit: int) -> list:
+    """Keep at most `limit` tracks per (main) artist, preserving order."""
+    counts: dict = {}
+    result: list = []
+    for track in tracks:
+        artist = getattr(track, "artist", None)
+        artist_id = getattr(artist, "id", None) if artist else None
+        if artist_id is not None:
+            if counts.get(artist_id, 0) >= limit:
+                continue
+            counts[artist_id] = counts.get(artist_id, 0) + 1
+        result.append(track)
     return result
 
 
@@ -517,8 +540,65 @@ def _track_artist_ids(track) -> set:
     return ids
 
 
+def _untrusted_artist_seeds(tracks: list, trusted_artist_ids: set):
+    """Yield (artist_id, name, isrc) for the main artist of each track whose
+    artist is not already trusted, deduped. ISRC is the reliable MusicBrainz
+    join key (see musicbrainz.enrich_artist)."""
+    seen: set = set()
+    for t in tracks:
+        artist = getattr(t, "artist", None)
+        artist_id = getattr(artist, "id", None) if artist else None
+        if artist_id is None or artist_id in trusted_artist_ids or artist_id in seen:
+            continue
+        seen.add(artist_id)
+        yield artist_id, getattr(artist, "name", "") or "", getattr(t, "isrc", None)
+
+
+def _mb_trusted_artist_ids(
+    tracks: list,
+    trusted_artist_ids: set,
+    prompt_genres: list,
+    use_musicbrainz: bool,
+    cancel_event: threading.Event,
+    budget: list,
+) -> set:
+    """Rescue on-genre track candidates whose artist isn't otherwise trusted.
+
+    For each not-yet-trusted track artist, look up its MusicBrainz genres/tags
+    (cache-first; at most `budget[0]` fresh lookups, decremented in place so the
+    cap is shared across the whole generation) and trust it when those genres
+    intersect `prompt_genres`. The artist is NOT added to the taste corpus.
+    """
+    target = {g.lower() for g in (prompt_genres or []) if g}
+    if not target:
+        return set()
+    rescued: set = set()
+    for artist_id, name, isrc in _untrusted_artist_seeds(tracks, trusted_artist_ids):
+        if cancel_event.is_set():
+            break
+        info = musicbrainz.get_cached(artist_id)
+        if info is None:
+            if not use_musicbrainz or budget[0] <= 0:
+                continue
+            info = musicbrainz.enrich_artist(artist_id, name, isrc, cancel_event)
+            budget[0] -= 1
+        gens = {
+            g.lower() for g in (info.get("genres") or []) + (info.get("tags") or []) if g
+        }
+        if gens & target:
+            rescued.add(artist_id)
+    if rescued:
+        logger.debug("MB rescue: trusted %d extra artist(s)", len(rescued))
+    return rescued
+
+
 def _query_candidates(
-    results: dict, genre_trusted_artist_ids: set
+    results: dict,
+    genre_trusted_artist_ids: set,
+    prompt_genres: list,
+    use_musicbrainz: bool,
+    cancel_event: threading.Event,
+    mb_budget: list,
 ) -> tuple[list, list]:
     """Split a search result into ordered (track_candidates, artist_candidates).
 
@@ -557,6 +637,14 @@ def _query_candidates(
             tracks.append(t)
             seen_t.add(t.id)
 
+    # Rescue on-genre tracks whose artist isn't corroborated, via ad-hoc
+    # MusicBrainz genre lookup — the search usually returns tracks (not artists),
+    # so without this most candidates are dropped and seeds starve.
+    trusted_artist_ids |= _mb_trusted_artist_ids(
+        tracks, trusted_artist_ids, prompt_genres, use_musicbrainz,
+        cancel_event, mb_budget,
+    )
+
     trusted_tracks = [
         t for t in tracks if _track_artist_ids(t) & trusted_artist_ids
     ]
@@ -565,6 +653,7 @@ def _query_candidates(
             "Query candidates: dropped %d uncorroborated track(s)",
             len(tracks) - len(trusted_tracks),
         )
+    logger.info("Query candidates: %d tracks, %d artists", len(trusted_tracks), len(artists))
     return trusted_tracks, artists
 
 
@@ -608,6 +697,8 @@ def _collect_query_radios(
     cancel_event: threading.Event,
     exclude_artist_ids: set,
     genre_trusted_artist_ids: set,
+    prompt_genres: list,
+    use_musicbrainz: bool,
 ) -> list:
     """3c — at most one radio mix per query, alternating track/artist kind.
 
@@ -625,16 +716,23 @@ def _collect_query_radios(
     fetched_artist_ids: set = set()
     used_seed_ids: set = set()
     per_seed_pools: list = []
+    # One-element cell so the MB lookup budget is shared across every query.
+    mb_budget = [_QUERY_MB_BUDGET]
 
     for idx, query in enumerate((queries or [])[:5]):
         if cancel_event.is_set() or len(per_seed_pools) >= _MAX_QUERY_RADIOS:
             break
         try:
             results = utils.session.search(query, [Track, Artist], limit=5)
+            logger.info("Search results for query: %s", query)
+            logger.info("Search results: %s", results)
         except Exception:
             logger.exception("Search failed for query: %s", query)
             continue
-        tracks_c, artists_c = _query_candidates(results, genre_trusted_artist_ids)
+        tracks_c, artists_c = _query_candidates(
+            results, genre_trusted_artist_ids, prompt_genres,
+            use_musicbrainz, cancel_event, mb_budget,
+        )
         # Alternate which kind each query reaches for first.
         if idx % 2 == 0:
             ordered = (("track", tracks_c), ("artist", artists_c))
@@ -682,6 +780,62 @@ def _collect_query_radios(
         )
     logger.debug("3c radios: %d tracks from %d working pools", len(merged), len(per_seed_pools))
     return merged
+
+
+def _collect_playlist_tracks(playlist_names: list, cancel_event: threading.Event) -> list:
+    """3d — tracks from playlists the LLM named.
+
+    Resolve each name against the user's own playlists first (the names the LLM
+    was given as context), then fall back to a TIDAL public-playlist search. Each
+    playlist contributes up to _PER_SEED_LIMIT shuffled tracks to the pool.
+    """
+    names = [n for n in (playlist_names or []) if isinstance(n, str) and n.strip()][:3]
+    if not names:
+        return []
+
+    def _norm(s: str) -> str:
+        return " ".join((s or "").lower().split())
+
+    owned = list(utils.user_playlists) + list(utils.favourite_playlists)
+    by_name: dict = {}
+    for p in owned:
+        pname = getattr(p, "name", None)
+        if pname:
+            by_name.setdefault(_norm(pname), p)
+
+    collected: list = []
+    seen_playlist_ids: set = set()
+    for name in names:
+        if cancel_event.is_set():
+            break
+        playlist = by_name.get(_norm(name))
+        if playlist is None:
+            try:
+                results = utils.session.search(name, [Playlist], limit=3)
+                top_hit = results.get("top_hit")
+                playlists = results.get("playlists") or []
+                playlist = next(
+                    (p for p in playlists if hasattr(p, "id")),
+                    top_hit if isinstance(top_hit, Playlist) else None,
+                )
+            except Exception:
+                logger.exception("Playlist search failed for: %s", name)
+                continue
+        if playlist is None or getattr(playlist, "id", None) in seen_playlist_ids:
+            logger.debug("Playlist pick %r → no/duplicate playlist", name)
+            continue
+        seen_playlist_ids.add(playlist.id)
+        try:
+            tracks = list(playlist.tracks())
+        except Exception:
+            logger.exception("Failed to fetch tracks for playlist: %s", name)
+            continue
+        random.shuffle(tracks)
+        sample = tracks[:_PER_SEED_LIMIT]
+        collected.extend(sample)
+        logger.info("3d playlist %r → %d/%d tracks", name, len(sample), len(tracks))
+    logger.debug("3d playlists: %d tracks from %d names", len(collected), len(names))
+    return collected
 
 
 def _decade_prefilter(tracks: list, quality_criteria: dict) -> list:
@@ -883,6 +1037,8 @@ def generate_radio(
     skipped_ids: set | None = None,
     banned_ids: dict | None = None,
     genre_trusted_artist_ids: set | None = None,
+    prompt_genres: list | None = None,
+    use_musicbrainz: bool = False,
 ) -> tuple:
     """Return (title, tracks, suggestions, updated_history)."""
     logger.debug("generate_radio prompt=%r provider=%s model=%s history_turns=%d use_critic=%s", prompt, provider, model, len(conversation_history or []), use_critic)
@@ -931,16 +1087,18 @@ def generate_radio(
     search_queries = data["search_queries"]
     familiar_artist_picks = data.get("familiar_artist_picks", [])
     familiar_track_picks = data.get("familiar_track_picks", [])
+    llm_playlist_names = data.get("playlist_names", [])
     suggestions = [_clean_display_string(s, 60) for s in data.get("suggestions", []) if s]
     quality_criteria = data.get("quality_criteria", {})
 
     if cancel_event.is_set():
         raise InterruptedError("Cancelled")
 
-    # Build the candidate pool from three sources:
+    # Build the candidate pool from four sources:
     #   3a — songs the LLM named directly (added as-is)
     #   3b — N random top tracks per familiar artist (disk-persisted)
     #   3c — radio mixes from search queries, excluding the 3b artists
+    #   3d — tracks from playlists the LLM named (user library, then TIDAL search)
     picks_3a = _resolve_familiar_tracks(familiar_track_picks, cancel_event)
     artist_3b, familiar_artist_ids = _resolve_familiar_artist_tracks(
         familiar_artist_picks, cancel_event
@@ -951,8 +1109,9 @@ def generate_radio(
 
     radio_3c = _collect_query_radios(
         search_queries, cancel_event, familiar_artist_ids,
-        genre_trusted_artist_ids or set(),
+        genre_trusted_artist_ids or set(), prompt_genres or [], use_musicbrainz,
     )
+    playlist_3d = _collect_playlist_tracks(llm_playlist_names, cancel_event)
 
     # 3a familiar track picks are mandatory: they bypass the decade and critic
     # filters and get reserved slots in the final cut, so they always appear.
@@ -960,9 +1119,9 @@ def generate_radio(
     protected = _dedup_tracks(picks_3a)
     protected_ids = {t.id for t in protected if hasattr(t, "id")}
 
-    # Discovery pool = 3b + 3c, deduped against the mandatory tracks (so the same
-    # song never appears twice) and shuffled.
-    pool = _dedup_tracks(list(protected) + artist_3b + radio_3c)
+    # Discovery pool = 3b + 3c + 3d, deduped against the mandatory tracks (so the
+    # same song never appears twice) and shuffled.
+    pool = _dedup_tracks(list(protected) + artist_3b + radio_3c + playlist_3d)
     pool = [t for t in pool if t.id not in protected_ids]
     random.shuffle(pool)
 
@@ -984,6 +1143,11 @@ def generate_radio(
     # Skip/ban apply to everything, including the mandatory tracks.
     protected = _apply_exclusions(protected, skipped_ids, banned_ids)
     pool = _apply_exclusions(pool, skipped_ids, banned_ids)
+
+    # Cap per-artist representation just before the total cut so it spans every
+    # source (3b/3c/3d). The mandatory picks are exempt — they're not counted and
+    # always appear — since the LLM already chooses them for variety.
+    pool = _cap_per_artist(pool, _PER_ARTIST_LIMIT)
 
     # Reserve slots for the mandatory tracks, fill the rest from the pool, then
     # shuffle so the familiar picks aren't all clustered at the front.

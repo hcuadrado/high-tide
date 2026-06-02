@@ -494,6 +494,32 @@ class HTAIRadioPage(Page):
             self._state_stack.set_visible_child_name(target)
             self._set_results_chrome_visible(target == "results")
 
+    def remove_banned(self, *, track_id: str = None, artist_id: str = None) -> None:
+        """Drop a just-banned track (or all of an artist's tracks) from the
+        currently shown list and re-render. Action targets arrive as strings, so
+        ids are compared as strings."""
+        if not self._tracks:
+            return
+
+        def _is_banned(t) -> bool:
+            if track_id is not None and str(t.id) == track_id:
+                return True
+            if (
+                artist_id is not None
+                and t.artist
+                and hasattr(t.artist, "id")
+                and str(t.artist.id) == artist_id
+            ):
+                return True
+            return False
+
+        remaining = [t for t in self._tracks if not _is_banned(t)]
+        if len(remaining) == len(self._tracks):
+            return
+        self.update_tracks(
+            self._ai_title, remaining, self._suggestions, self._history
+        )
+
     def update_tracks(
         self,
         title: str,
