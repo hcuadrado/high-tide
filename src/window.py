@@ -978,10 +978,11 @@ class HighTideWindow(Adw.ApplicationWindow):
             taste_sample = taste_corpus.sample_for_radio(
                 corpus, prompt=prompt, prompt_genres=prompt_genres
             )
-            corpus_ids = {
-                "artist_ids": {a["id"] for a in corpus.get("artists", [])},
-                "track_ids": {t["id"] for t in corpus.get("tracks", [])},
-            }
+            # Corpus artists whose genres match the prompt — lets on-genre tracks
+            # seed radios even when a query's artist search doesn't surface them.
+            genre_trusted = taste_corpus.genre_trusted_artist_ids(
+                corpus, prompt_genres
+            )
             title, tracks, suggestions, updated_history = ai_agent.generate_radio(
                 prompt=prompt,
                 provider=provider,
@@ -993,9 +994,9 @@ class HighTideWindow(Adw.ApplicationWindow):
                 conversation_history=history,
                 base_url=base_url,
                 use_critic=use_critic,
-                corpus_ids=corpus_ids,
                 skipped_ids=skipped_ids,
                 banned_ids=banned_ids,
+                genre_trusted_artist_ids=genre_trusted,
             )
             GLib.idle_add(
                 self._on_radio_ready,

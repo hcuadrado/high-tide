@@ -4,6 +4,7 @@
 
 import json
 import logging
+import random
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -13,7 +14,7 @@ from tidalapi.media import Track
 from tidalapi.artist import Artist
 from tidalapi.exceptions import MetadataNotAvailable, ObjectNotFound
 
-from . import utils
+from . import artist_tracks, utils
 from .ai_providers import (
     call_anthropic,
     call_gemini,
@@ -34,11 +35,11 @@ _SYSTEM_PROMPT = (
     '  "strategy": "search",\n'
     '  "search_queries": ["query1", "query2"],\n'
     '  "familiar_artist_picks": ["Artist Name"],\n'
+    '  "familiar_track_picks": ["Song Title by Artist Name"],\n'
     '  "playlist_names": [],\n'
     '  "suggestions": ["More energetic", "Earlier era", "Add more variety", "Slower tempo"],\n'
     '  "quality_criteria": {\n'
     '    "decade": "",\n'
-    '    "energy": "",\n'
     '    "genres": []\n'
     "  }\n"
     "}\n\n"
@@ -48,13 +49,15 @@ _SYSTEM_PROMPT = (
     "history and playlists that genuinely match the requested vibe. Picks are drawn "
     "from listening history and playlists, not just liked favourites. Pick artists "
     "from DIFFERENT genres/styles to maximize variety — avoid stacking picks from "
-    "the same genre, since each pick seeds ~30 tracks from its style. These become "
-    "seeds alongside search_queries. Omit or leave empty [] if no familiar artist "
-    "fits.\n"
+    "the same genre, since each pick seeds several of that artist's tracks. Omit or "
+    "leave empty [] if no familiar artist fits.\n"
+    "- familiar_track_picks: up to 8 specific songs from the user's listening history "
+    'or playlists that fit the vibe. Format each as "Song Title by Artist Name" so it '
+    "can be looked up. These tracks are added to the station directly. Omit or leave "
+    "empty [] if none fit.\n"
     "- Maximum 3 playlist_names (use names from user context when strategy is playlist)\n"
     "- Maximum 4 suggestions — phrase as follow-up instructions, not descriptions\n"
     '- quality_criteria.decade: format "1990s" / "2000s", or "" if not applicable\n'
-    '- quality_criteria.energy: "high" / "medium" / "low", or ""\n'
     "- quality_criteria.genres: list of genre strings\n"
     "- On refinement turns, return at least 3 search_queries — broaden where needed "
     "rather than narrowing to one."
@@ -150,7 +153,7 @@ def interpret_prompt_genres(
                 canonical = vocab_lower.get(g.strip().lower())
                 if canonical and canonical not in result:
                     result.append(canonical)
-        logger.debug("interpret_prompt_genres: %r -> %s", prompt, result)
+        logger.info("interpret_prompt_genres: %r -> %s", prompt, result)
         return result
     except Exception:
         logger.exception("Prompt genre interpretation failed")
@@ -181,13 +184,17 @@ def _parse_response(text: str) -> dict:
     data["familiar_artist_picks"] = [
         p for p in data.get("familiar_artist_picks", []) if isinstance(p, str)
     ][:6]
+    data["familiar_track_picks"] = [
+        p for p in data.get("familiar_track_picks", []) if isinstance(p, str)
+    ][:_FAMILIAR_TRACK_PICKS_MAX]
     data["playlist_names"] = data.get("playlist_names", [])[:3]
     data["suggestions"] = data.get("suggestions", [])[:4]
-    logger.debug(
-        "Parsed response: title=%r queries=%s familiar_picks=%s playlists=%s",
+    logger.info(
+        "Parsed response: title=%r queries=%s familiar_artists=%s familiar_tracks=%s playlists=%s",
         data.get("title"),
         data["search_queries"],
         data["familiar_artist_picks"],
+        data["familiar_track_picks"],
         data["playlist_names"],
     )
     return data
@@ -256,106 +263,150 @@ def _build_user_message(prompt: str, taste_sample: dict, playlist_names: list) -
     return "\n\n".join(parts)
 
 
-def _resolve_seeds(
-    search_queries: list,
-    playlist_names: list,
-    cancel_event: threading.Event,
-    familiar_artist_picks: list | None = None,
-) -> list:
-    seeds = []
+def _search_artist(name: str, cancel_event: threading.Event):
+    """Resolve an artist name to an Artist via TIDAL search, or None."""
+    if cancel_event.is_set():
+        return None
+    try:
+        results = utils.session.search(name, [Artist], limit=3)
+        artists = results.get("artists") or []
+        top_hit = results.get("top_hit")
+        return next(
+            (a for a in artists if hasattr(a, "id")),
+            top_hit if isinstance(top_hit, Artist) else None,
+        )
+    except Exception:
+        logger.exception("Search failed for artist: %s", name)
+        return None
+
+
+def _norm_artist(s: str) -> str:
+    """Lowercase, collapse whitespace, and drop a leading 'the ' for matching."""
+    s = " ".join((s or "").lower().split())
+    return s[4:] if s.startswith("the ") else s
+
+
+def _track_artist_names(track) -> list:
+    """All artist names credited on a track (main + featured)."""
+    names = []
+    if track.artist and getattr(track.artist, "name", None):
+        names.append(track.artist.name)
+    for a in getattr(track, "artists", None) or []:
+        if getattr(a, "name", None):
+            names.append(a.name)
+    return names
+
+
+def _best_track_for_artist(candidates: list, expected_artist: str):
+    """Pick the candidate whose artist matches `expected_artist`.
+
+    Exact (normalized) match wins; otherwise a length-guarded substring match.
+    When an artist was given but nothing matches, returns None — dropping the
+    pick rather than adding a wrong/karaoke version (those are credited to a
+    karaoke label, so they never match the real artist). With no expected artist
+    (a malformed pick), falls back to the first candidate.
+    """
+    valid = [t for t in candidates if hasattr(t, "id")]
+    if not valid:
+        return None
+    if not expected_artist:
+        return valid[0]
+    partial = None
+    for track in valid:
+        names = [_norm_artist(n) for n in _track_artist_names(track)]
+        if expected_artist in names:
+            return track
+        if partial is None and any(
+            len(n) >= 4 and (expected_artist in n or n in expected_artist)
+            for n in names
+        ):
+            partial = track
+    return partial
+
+
+def _resolve_familiar_tracks(picks: list, cancel_event: threading.Event) -> list:
+    """3a — resolve "Song by Artist" strings to Track objects (added directly).
+
+    Prefers the candidate whose artist matches the artist named in the pick, so
+    karaoke/cover versions don't sneak in over the real recording.
+    """
+    tracks: list = []
     seen_ids: set = set()
-
-    # Resolve familiar picks first so they survive the 8-seed cap.
-    for name in (familiar_artist_picks or [])[:6]:
+    for text in (picks or [])[:_FAMILIAR_TRACK_PICKS_MAX]:
         if cancel_event.is_set():
             break
+        _title, _sep, artist = text.rpartition(" by ")
+        expected = _norm_artist(artist)
         try:
-            results = utils.session.search(name, [Artist], limit=3)
-            artists = results.get("artists") or []
-            top_hit = results.get("top_hit")
-            match = next(
-                (a for a in artists if hasattr(a, "id")),
-                top_hit if isinstance(top_hit, Artist) else None,
+            results = utils.session.search(text, [Track], limit=5)
+        except Exception:
+            logger.exception("Search failed for familiar track pick: %s", text)
+            continue
+        candidates: list = []
+        top_hit = results.get("top_hit")
+        if isinstance(top_hit, Track):
+            candidates.append(top_hit)
+        candidates.extend(results.get("tracks") or [])
+
+        track = _best_track_for_artist(candidates, expected)
+        if track is not None and track.id not in seen_ids:
+            tracks.append(track)
+            seen_ids.add(track.id)
+            logger.debug(
+                "Familiar track pick %r → track id=%s (%s)",
+                text, track.id, getattr(track.artist, "name", "?"),
             )
-            if match is not None and match.id not in seen_ids:
-                logger.debug("Familiar pick %r → artist id=%s", name, match.id)
-                seeds.append(match)
-                seen_ids.add(match.id)
-            else:
-                logger.debug("Familiar pick %r → no search result", name)
-        except Exception:
-            logger.exception("Search failed for familiar pick: %s", name)
+        elif track is None:
+            logger.debug("Familiar track pick %r → no artist match, dropped", text)
+    logger.debug("Resolved %d/%d familiar track picks", len(tracks), len(picks or []))
+    return tracks
 
-    for query in search_queries[:5]:
+
+def _resolve_familiar_artist_tracks(
+    picks: list, cancel_event: threading.Event
+) -> tuple[list, set]:
+    """3b — for each familiar artist, sample N random tracks from its top tracks.
+
+    Returns (tracks, artist_ids). Top tracks are pulled from the disk-persisted
+    cache so regenerations don't refetch. Returning the resolved artist ids lets
+    3c exclude these artists from its radio results.
+    """
+    tracks: list = []
+    artist_ids: set = set()
+    for name in (picks or [])[:6]:
         if cancel_event.is_set():
             break
-        try:
-            results = utils.session.search(query, [Track, Artist], limit=5)
-            seed = None
-            top_hit = results.get("top_hit")
-            artists = results.get("artists") or []
-            # Always prefer Artist seeds — their radio mixes are far more
-            # reliable than track radio, which frequently 404s.
-            if artists:
-                seed = artists[0]
-                if not isinstance(top_hit, Artist):
-                    logger.debug("Query %r: using Artist seed over Track top_hit", query)
-            elif isinstance(top_hit, (Track, Artist)):
-                seed = top_hit
-            elif results.get("tracks"):
-                seed = results["tracks"][0]
-
-            if seed is not None and seed.id not in seen_ids:
-                logger.debug("Query %r → seed %s id=%s", query, type(seed).__name__, seed.id)
-                seeds.append(seed)
-                seen_ids.add(seed.id)
-            else:
-                logger.debug("Query %r → no usable seed", query)
-        except Exception:
-            logger.exception("Search failed for query: %s", query)
-
-    for name in playlist_names[:3]:
-        if cancel_event.is_set():
-            break
-        for playlist in utils.user_playlists:
-            if hasattr(playlist, "name") and playlist.name == name:
-                try:
-                    pl_tracks = list(playlist.tracks())
-                    added = 0
-                    for pt in pl_tracks[:3]:
-                        if pt.id not in seen_ids:
-                            seeds.append(pt)
-                            seen_ids.add(pt.id)
-                            added += 1
-                    logger.debug("Playlist %r → %d seed tracks", name, added)
-                except Exception:
-                    logger.exception("Failed to load playlist: %s", name)
-                break
-
-    # Pad with favourite artists when fewer than 3 seeds resolved.
-    if len(seeds) < 3:
-        logger.debug("Seed top-up: %d seeds resolved, padding from favourite_artists", len(seeds))
-        for artist in utils.favourite_artists:
-            if len(seeds) >= 8:
-                break
-            if hasattr(artist, "id") and artist.id not in seen_ids:
-                seeds.append(artist)
-                seen_ids.add(artist.id)
-
-    result = seeds[:8]
-    logger.debug(
-        "Resolved %d seeds from %d queries + %d playlist names + familiar picks",
-        len(result), len(search_queries), len(playlist_names),
-    )
-    return result
+        artist = _search_artist(name, cancel_event)
+        if artist is None or artist.id in artist_ids:
+            logger.debug("Familiar artist pick %r → no/duplicate artist", name)
+            continue
+        artist_ids.add(artist.id)
+        top = artist_tracks.get_top_tracks(utils.session, artist.id)
+        if not top:
+            logger.debug("Familiar artist %r (id=%s) → no top tracks", name, artist.id)
+            continue
+        sample = random.sample(top, min(_FAMILIAR_TRACKS_PER_ARTIST, len(top)))
+        tracks.extend(sample)
+        logger.debug(
+            "Familiar artist %r (id=%s) → %d/%d sampled tracks",
+            name, artist.id, len(sample), len(top),
+        )
+    logger.debug("Resolved %d familiar-artist tracks from %d artists", len(tracks), len(artist_ids))
+    return tracks, artist_ids
 
 
-_PER_SEED_LIMIT = 40
-_PER_ARTIST_LIMIT = 4
+_PER_SEED_LIMIT = 25
+_PER_ARTIST_LIMIT = 5
 _TOTAL_LIMIT = 100
 _CRITIC_BATCH = 50
 # Critic batches are independent LLM calls, scored concurrently up to this many.
 _CRITIC_MAX_WORKERS = 4
+_FAMILIAR_TRACKS_PER_ARTIST = 7
+_FAMILIAR_TRACK_PICKS_MAX = 11
+# 3c collects at most one radio mix per query, capped at this many total. Kept
+# tight on purpose: the search queries are already diverse, so a few radios cover
+# the vibe without diluting it.
+_MAX_QUERY_RADIOS = 5
 
 
 def _fetch_seed_pool(
@@ -412,19 +463,11 @@ def _fetch_seed_pool(
     return []
 
 
-def _get_radio_tracks(seeds: list, cancel_event: threading.Event) -> list:
-    fallback: list = []
-    fetched_artist_ids: set = set()
-    per_seed_pools: list[list] = []
-    for seed in seeds:
-        if cancel_event.is_set():
-            break
-        pool = _fetch_seed_pool(seed, cancel_event, fallback, fetched_artist_ids)
-        if pool:
-            per_seed_pools.append(pool)
-            logger.debug("Seed %s pool: %d tracks", seed.id, len(pool))
+def _round_robin_merge(per_seed_pools: list) -> list:
+    """Interleave per-seed track pools with id/ISRC dedup and per-artist cap.
 
-    # Round-robin merge with per-artist cap so no single seed (or artist) dominates.
+    Round-robin so no single seed (or artist) dominates the result.
+    """
     result: list = []
     seen_ids: set = set()
     seen_isrcs: set = set()
@@ -456,12 +499,189 @@ def _get_radio_tracks(seeds: list, cancel_event: threading.Event) -> list:
             if artist_id is not None:
                 artist_counts[artist_id] = artist_counts.get(artist_id, 0) + 1
 
-    final = result if result else fallback
     logger.debug(
-        "Total radio tracks: %d (fallback=%s, distinct artists=%d)",
-        len(final), not result, len(artist_counts),
+        "Round-robin merge: %d tracks from %d pools (distinct artists=%d)",
+        len(result), len(per_seed_pools), len(artist_counts),
     )
-    return final
+    return result
+
+
+def _track_artist_ids(track) -> set:
+    """All artist ids associated with a track (main + featured)."""
+    ids: set = set()
+    if track.artist and hasattr(track.artist, "id"):
+        ids.add(track.artist.id)
+    for a in getattr(track, "artists", None) or []:
+        if hasattr(a, "id"):
+            ids.add(a.id)
+    return ids
+
+
+def _query_candidates(
+    results: dict, genre_trusted_artist_ids: set
+) -> tuple[list, list]:
+    """Split a search result into ordered (track_candidates, artist_candidates).
+
+    The top_hit is placed first within its kind so the strongest match is tried
+    first when fetching a radio.
+
+    Track candidates are restricted to tracks corroborated as on-genre, so an
+    incidental title match can't seed a radio. A descriptive query ("rock punk
+    para fiesta") can match a track on title alone — e.g. an off-genre cumbia
+    song with "fiesta" in its name — and seeding that track's radio would flood
+    the station with the wrong genre. A track is trusted when its artist either
+    (a) appears among the query's own artist results, or (b) is a corpus artist
+    whose genres match the prompt (`genre_trusted_artist_ids`). The cumbia match
+    satisfies neither, so it is dropped.
+    """
+    artists: list = []
+    seen_a: set = set()
+    top_hit = results.get("top_hit")
+    if isinstance(top_hit, Artist):
+        artists.append(top_hit)
+        seen_a.add(top_hit.id)
+    for a in results.get("artists") or []:
+        if hasattr(a, "id") and a.id not in seen_a:
+            artists.append(a)
+            seen_a.add(a.id)
+
+    trusted_artist_ids = set(seen_a) | genre_trusted_artist_ids
+
+    tracks: list = []
+    seen_t: set = set()
+    if isinstance(top_hit, Track):
+        tracks.append(top_hit)
+        seen_t.add(top_hit.id)
+    for t in results.get("tracks") or []:
+        if hasattr(t, "id") and t.id not in seen_t:
+            tracks.append(t)
+            seen_t.add(t.id)
+
+    trusted_tracks = [
+        t for t in tracks if _track_artist_ids(t) & trusted_artist_ids
+    ]
+    if len(trusted_tracks) < len(tracks):
+        logger.debug(
+            "Query candidates: dropped %d uncorroborated track(s)",
+            len(tracks) - len(trusted_tracks),
+        )
+    return trusted_tracks, artists
+
+
+def _seed_label(seed) -> str:
+    """Human-readable description of a radio seed for logging."""
+    if isinstance(seed, Track):
+        artist = getattr(seed.artist, "name", "?") if seed.artist else "?"
+        return f"track {seed.name!r} by {artist} (id={seed.id})"
+    if isinstance(seed, Artist):
+        return f"artist {getattr(seed, 'name', '?')!r} (id={seed.id})"
+    return f"seed id={getattr(seed, 'id', '?')}"
+
+
+def _first_working_pool(
+    candidates: list,
+    cancel_event: threading.Event,
+    fallback: list,
+    fetched_artist_ids: set,
+    used_seed_ids: set,
+) -> tuple:
+    """Return (seed, pool) for the first non-empty radio, or (None, None).
+
+    A seed whose radio 404s (empty pool) is skipped for the next candidate.
+    Seeds already used for a pool are skipped so the same radio isn't fetched
+    twice across queries.
+    """
+    for seed in candidates:
+        if cancel_event.is_set():
+            break
+        if seed.id in used_seed_ids:
+            continue
+        pool = _fetch_seed_pool(seed, cancel_event, fallback, fetched_artist_ids)
+        if pool:
+            used_seed_ids.add(seed.id)
+            return seed, pool
+    return None, None
+
+
+def _collect_query_radios(
+    queries: list,
+    cancel_event: threading.Event,
+    exclude_artist_ids: set,
+    genre_trusted_artist_ids: set,
+) -> list:
+    """3c — at most one radio mix per query, alternating track/artist kind.
+
+    Each query contributes a single working radio: the preferred kind alternates
+    per query (so coverage splits between track and artist radios), and within a
+    query a 404 mix falls back to the next candidate, then to the other kind.
+    Capped at `_MAX_QUERY_RADIOS` total to keep the station tight. Favourite
+    artists are a last resort if no query yields a radio. Tracks by any artist in
+    `exclude_artist_ids` (the 3b artists) are dropped so 3c contributes only
+    different artists. `genre_trusted_artist_ids` are corpus artists whose genres
+    match the prompt — tracks by them may seed a radio even without query-artist
+    corroboration.
+    """
+    fallback: list = []
+    fetched_artist_ids: set = set()
+    used_seed_ids: set = set()
+    per_seed_pools: list = []
+
+    for idx, query in enumerate((queries or [])[:5]):
+        if cancel_event.is_set() or len(per_seed_pools) >= _MAX_QUERY_RADIOS:
+            break
+        try:
+            results = utils.session.search(query, [Track, Artist], limit=5)
+        except Exception:
+            logger.exception("Search failed for query: %s", query)
+            continue
+        tracks_c, artists_c = _query_candidates(results, genre_trusted_artist_ids)
+        # Alternate which kind each query reaches for first.
+        if idx % 2 == 0:
+            ordered = (("track", tracks_c), ("artist", artists_c))
+        else:
+            ordered = (("artist", artists_c), ("track", tracks_c))
+        for kind, cand in ordered:
+            seed, pool = _first_working_pool(
+                cand, cancel_event, fallback, fetched_artist_ids, used_seed_ids
+            )
+            if pool:
+                per_seed_pools.append(pool)
+                logger.info(
+                    "3c seed: query %r → %s radio from %s (%d tracks)",
+                    query, kind, _seed_label(seed), len(pool),
+                )
+                break
+        else:
+            logger.debug("Query %r → no working radio", query)
+
+    # Last resort: favourite artists, only if no query produced a radio.
+    if not per_seed_pools:
+        for artist in utils.favourite_artists:
+            if cancel_event.is_set() or len(per_seed_pools) >= _MAX_QUERY_RADIOS:
+                break
+            seed, pool = _first_working_pool(
+                [artist], cancel_event, fallback, fetched_artist_ids, used_seed_ids
+            )
+            if pool:
+                per_seed_pools.append(pool)
+                logger.info(
+                    "3c seed: favourite fallback → %s (%d tracks)",
+                    _seed_label(seed), len(pool),
+                )
+
+    merged = _round_robin_merge(per_seed_pools) or fallback
+
+    if exclude_artist_ids:
+        before = len(merged)
+        merged = [
+            t for t in merged
+            if not (_track_artist_ids(t) & exclude_artist_ids)
+        ]
+        logger.debug(
+            "3c radios: excluded familiar-artist tracks %d → %d", before, len(merged)
+        )
+    logger.debug("3c radios: %d tracks from %d working pools", len(merged), len(per_seed_pools))
+    return merged
 
 
 def _decade_prefilter(tracks: list, quality_criteria: dict) -> list:
@@ -491,69 +711,58 @@ def _decade_prefilter(tracks: list, quality_criteria: dict) -> list:
     return filtered if filtered else tracks
 
 
-def _familiar_blend(
-    tracks: list,
-    seeds: list,
-    target_ratio: float = 0.4,
-    corpus_ids: dict | None = None,
-) -> list:
-    corpus_artist_ids = (corpus_ids or {}).get("artist_ids", set())
-    corpus_track_ids = (corpus_ids or {}).get("track_ids", set())
+def _dedup_tracks(tracks: list) -> list:
+    """Drop duplicate tracks by id, then ISRC, then normalized name+artist.
 
-    def is_familiar(track) -> bool:
-        if not hasattr(track, "id"):
-            return False
-        if track.id in corpus_track_ids:
-            return True
-        if track.artist and hasattr(track.artist, "id") and track.artist.id in corpus_artist_ids:
-            return True
-        for a in getattr(track, "artists", None) or []:
-            if hasattr(a, "id") and a.id in corpus_artist_ids:
-                return True
-        return False
-
-    familiar = [t for t in tracks if is_familiar(t)]
-    unfamiliar = [t for t in tracks if not is_familiar(t)]
-    cap = min(len(tracks), 100)
-    target_count = round(cap * target_ratio)
-
-    logger.debug(
-        "Blend: %d familiar / %d unfamiliar from %d tracks, target=%d familiar in cap=%d",
-        len(familiar), len(unfamiliar), len(tracks), target_count, cap,
-    )
-
-    # Interleave: distribute familiar at ~target_ratio spacing, preserving bucket order.
-    familiar_needed = min(target_count, len(familiar))
-    unfamiliar_needed = min(cap - familiar_needed, len(unfamiliar))
-    # Backfill: if unfamiliar ran short, let familiar absorb the slack.
-    if familiar_needed + unfamiliar_needed < cap:
-        extra = cap - familiar_needed - unfamiliar_needed
-        familiar_needed += min(extra, len(familiar) - familiar_needed)
+    The normalized name+artist key catches the same song released on multiple
+    albums, which has distinct ids (and sometimes distinct ISRCs) that the first
+    two keys miss.
+    """
     result: list = []
-    fi = ui = 0
-    credit = 0.0
-    for _i in range(familiar_needed + unfamiliar_needed):
-        credit += target_ratio
-        if credit >= 1.0 and fi < familiar_needed:
-            result.append(familiar[fi])
-            fi += 1
-            credit -= 1.0
-        elif ui < unfamiliar_needed:
-            result.append(unfamiliar[ui])
-            ui += 1
-        elif fi < familiar_needed:
-            result.append(familiar[fi])
-            fi += 1
-        else:
-            break
-
-    logger.debug(
-        "Blend result: %d tracks (%d familiar, %d unfamiliar)",
-        len(result),
-        sum(1 for t in result if is_familiar(t)),
-        sum(1 for t in result if not is_familiar(t)),
-    )
+    seen_ids: set = set()
+    seen_isrcs: set = set()
+    seen_names: set = set()
+    for track in tracks:
+        if not hasattr(track, "id") or track.id in seen_ids:
+            continue
+        isrc = getattr(track, "isrc", None)
+        if isrc and isrc in seen_isrcs:
+            continue
+        artist_name = track.artist.name if track.artist and hasattr(track.artist, "name") else ""
+        name_key = (
+            " ".join((track.name or "").lower().split()),
+            " ".join(artist_name.lower().split()),
+        )
+        if name_key[0] and name_key in seen_names:
+            continue
+        result.append(track)
+        seen_ids.add(track.id)
+        if isrc:
+            seen_isrcs.add(isrc)
+        if name_key[0]:
+            seen_names.add(name_key)
     return result
+
+
+def _apply_exclusions(
+    tracks: list, skipped_ids: set | None, banned_ids: dict | None
+) -> list:
+    """Drop tracks the user skipped or banned (by track id or artist id)."""
+    if skipped_ids:
+        tracks = [t for t in tracks if t.id not in skipped_ids]
+    if banned_ids:
+        banned_track_ids = banned_ids.get("track_ids", set())
+        banned_artist_ids = banned_ids.get("artist_ids", set())
+        tracks = [
+            t for t in tracks
+            if t.id not in banned_track_ids
+            and not (
+                t.artist
+                and hasattr(t.artist, "id")
+                and t.artist.id in banned_artist_ids
+            )
+        ]
+    return tracks
 
 
 def _critic_score_batch(
@@ -671,9 +880,9 @@ def generate_radio(
     conversation_history=None,
     base_url: str = "",
     use_critic: bool = False,
-    corpus_ids: dict | None = None,
     skipped_ids: set | None = None,
     banned_ids: dict | None = None,
+    genre_trusted_artist_ids: set | None = None,
 ) -> tuple:
     """Return (title, tracks, suggestions, updated_history)."""
     logger.debug("generate_radio prompt=%r provider=%s model=%s history_turns=%d use_critic=%s", prompt, provider, model, len(conversation_history or []), use_critic)
@@ -692,7 +901,7 @@ def generate_radio(
         taste_sample=taste_sample or {},
         playlist_names=playlist_names or [],
     )
-    logger.debug("User message: %s", user_msg)
+    logger.info("User message: %s", user_msg)
     messages = history + [{"role": "user", "content": user_msg}]
 
     if cancel_event.is_set():
@@ -721,30 +930,50 @@ def generate_radio(
     title = _clean_display_string(raw_title, 80) if raw_title else _("AI Radio")
     search_queries = data["search_queries"]
     familiar_artist_picks = data.get("familiar_artist_picks", [])
-    playlist_names = data.get("playlist_names", [])
+    familiar_track_picks = data.get("familiar_track_picks", [])
     suggestions = [_clean_display_string(s, 60) for s in data.get("suggestions", []) if s]
     quality_criteria = data.get("quality_criteria", {})
 
     if cancel_event.is_set():
         raise InterruptedError("Cancelled")
 
-    seeds = _resolve_seeds(search_queries, playlist_names, cancel_event, familiar_artist_picks)
+    # Build the candidate pool from three sources:
+    #   3a — songs the LLM named directly (added as-is)
+    #   3b — N random top tracks per familiar artist (disk-persisted)
+    #   3c — radio mixes from search queries, excluding the 3b artists
+    picks_3a = _resolve_familiar_tracks(familiar_track_picks, cancel_event)
+    artist_3b, familiar_artist_ids = _resolve_familiar_artist_tracks(
+        familiar_artist_picks, cancel_event
+    )
 
     if cancel_event.is_set():
         raise InterruptedError("Cancelled")
 
-    tracks = _get_radio_tracks(seeds, cancel_event)
+    radio_3c = _collect_query_radios(
+        search_queries, cancel_event, familiar_artist_ids,
+        genre_trusted_artist_ids or set(),
+    )
+
+    # 3a familiar track picks are mandatory: they bypass the decade and critic
+    # filters and get reserved slots in the final cut, so they always appear.
+    # Only an explicit skip or ban can drop them.
+    protected = _dedup_tracks(picks_3a)
+    protected_ids = {t.id for t in protected if hasattr(t, "id")}
+
+    # Discovery pool = 3b + 3c, deduped against the mandatory tracks (so the same
+    # song never appears twice) and shuffled.
+    pool = _dedup_tracks(list(protected) + artist_3b + radio_3c)
+    pool = [t for t in pool if t.id not in protected_ids]
+    random.shuffle(pool)
 
     if quality_criteria:
-        tracks = _decade_prefilter(tracks, quality_criteria)
-
-    tracks = _familiar_blend(tracks, seeds, corpus_ids=corpus_ids)
+        pool = _decade_prefilter(pool, quality_criteria)
 
     if use_critic:
-        tracks = _critic_filter(
+        pool = _critic_filter(
             prompt,
             quality_criteria,
-            tracks,
+            pool,
             provider,
             api_key,
             model,
@@ -752,23 +981,18 @@ def generate_radio(
             cancel_event,
         )
 
-    if skipped_ids:
-        before = len(tracks)
-        tracks = [t for t in tracks if t.id not in skipped_ids]
-        logger.debug("Skipped filter: %d → %d tracks", before, len(tracks))
+    # Skip/ban apply to everything, including the mandatory tracks.
+    protected = _apply_exclusions(protected, skipped_ids, banned_ids)
+    pool = _apply_exclusions(pool, skipped_ids, banned_ids)
 
-    if banned_ids:
-        banned_track_ids = banned_ids.get("track_ids", set())
-        banned_artist_ids = banned_ids.get("artist_ids", set())
-        before = len(tracks)
-        tracks = [
-            t for t in tracks
-            if t.id not in banned_track_ids
-            and not (t.artist and hasattr(t.artist, "id") and t.artist.id in banned_artist_ids)
-        ]
-        logger.debug("Ban filter: %d → %d tracks", before, len(tracks))
+    # Reserve slots for the mandatory tracks, fill the rest from the pool, then
+    # shuffle so the familiar picks aren't all clustered at the front.
+    room = max(0, _TOTAL_LIMIT - len(protected))
+    tracks = list(protected) + pool[:room]
+    random.shuffle(tracks)
 
-    tracks = tracks[:_TOTAL_LIMIT]
-
-    logger.debug("generate_radio done: title=%r tracks=%d suggestions=%d", title, len(tracks), len(suggestions))
+    logger.debug(
+        "generate_radio done: title=%r tracks=%d (mandatory=%d) suggestions=%d",
+        title, len(tracks), len(protected), len(suggestions),
+    )
     return title, tracks, suggestions, updated_history

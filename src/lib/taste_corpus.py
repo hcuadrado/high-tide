@@ -446,11 +446,40 @@ def genre_vocabulary(corpus: dict, limit: int = 60) -> list:
     return ranked[:limit]
 
 
-def _genre_prerank(items: list, target_genres: set, genres_of) -> list:
-    """Float entries matching `target_genres` to the front.
+def genre_trusted_artist_ids(corpus: dict, prompt_genres: list) -> set:
+    """Corpus artist ids whose genres/tags match any of `prompt_genres`.
 
-    A boost, not a filter: when nothing matches, order is unchanged. Matched
-    entries land in the sample's top-weight anchor.
+    Used by AI Radio to trust radio seeds: a track by one of these artists is
+    known-on-genre (the user listens to them and their style matches the prompt),
+    so it may seed a radio even when a query's own artist search doesn't surface
+    it. Returns an empty set when the prompt has no interpreted genres.
+    """
+    target = {g.lower() for g in (prompt_genres or []) if g}
+    if not target:
+        return set()
+    trusted: set = set()
+    for a in corpus.get("artists", []):
+        if "id" not in a:
+            continue
+        gens = {
+            g.lower() for g in (a.get("genres") or []) + (a.get("tags") or []) if g
+        }
+        if gens & target:
+            trusted.add(a["id"])
+    logger.debug("taste_corpus: %d genre-trusted artists for prompt genres", len(trusted))
+    return trusted
+
+
+_GENRE_FILTER_FLOOR = 15
+
+
+def _genre_prerank(items: list, target_genres: set, genres_of) -> list:
+    """Filter entries to those matching `target_genres`, with a sparsity floor.
+
+    A hard filter: off-genre entries are dropped so the sample is genre-focused.
+    But when too few entries match (< `_GENRE_FILTER_FLOOR`), filtering would
+    starve the sample, so it degrades to a soft pre-rank (matched floated to the
+    front, nothing dropped). With no matches at all, order is unchanged.
     """
     if not target_genres:
         return items
@@ -463,8 +492,14 @@ def _genre_prerank(items: list, target_genres: set, genres_of) -> list:
             rest.append(it)
     if not matched:
         return items
-    logger.debug("taste_corpus: genre pre-rank floated %d entries", len(matched))
-    return matched + rest
+    if len(matched) < _GENRE_FILTER_FLOOR:
+        logger.debug(
+            "taste_corpus: genre pre-rank floated %d entries (below filter floor)",
+            len(matched),
+        )
+        return matched + rest
+    logger.debug("taste_corpus: genre filter kept %d entries", len(matched))
+    return matched
 
 
 def sample_for_radio(
